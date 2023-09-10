@@ -31,18 +31,29 @@ fn menu_item(_: ?*anyopaque) callconv(.C) void {
     playdate.system.logToConsole("hello menu");
 }
 
+var sound_toggle = false;
+var phase: u3 = 0;
+var total_len: usize = 0;
+var samples_per_phase_step: usize = 8;
+const step_size = 1;
 fn audioCallback(context: ?*anyopaque, left: [*c]i16, right: [*c]i16, len: c_int) callconv(.C) c_int {
     _ = context;
 
-    var btns: pdapi.PDButtons = undefined;
-    playdate.system.getButtonState(&btns, null, null);
+    const full = std.math.maxInt(i16) - 1;
+    const half = full / 2;
+    const table = [8]i16{ full, -full, 0, 0, half, -half, 0, 0 };
 
     const ulen: usize = @intCast(len);
-    if (btns.b) {
+
+    if (sound_toggle) {
         for (0..ulen) |i| {
-            const sign = 2 * @as(i16, @intCast((@divFloor(i, 100)) % 2)) - 1;
-            left[i] = sign * (std.math.maxInt(i16) - 1);
-            right[i] = sign * (std.math.maxInt(i16) - 1);
+            left[i] = table[phase];
+            right[i] = table[phase];
+
+            total_len +%= 1;
+            if (total_len % samples_per_phase_step == 0) {
+                phase +%= 1;
+            }
         }
     } else {
         @memset(left[0..@intCast(len)], 0);
@@ -76,12 +87,21 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     var accel_y: f32 = undefined;
     playdate.system.getAccelerometer(&accel_x, &accel_y, null);
 
-    var buf = [_]u8{0} ** 64;
+    var pushed: pdapi.PDButtons = undefined;
+    playdate.system.getButtonState(null, &pushed, null);
+
+    if (pushed.b) sound_toggle = !sound_toggle;
+    if (pushed.up) samples_per_phase_step += step_size;
+    if (pushed.down and samples_per_phase_step > step_size) samples_per_phase_step -= step_size;
+
+    var buf = [_]u8{0} ** 128;
     var fbs = std.io.fixedBufferStream(&buf);
-    fbs.writer().print("accel_x: {d:.2}\naccel_y: {d:.2}", .{ accel_x, accel_y }) catch unreachable;
+    fbs.writer().print(
+        "accel_x: {d:.2}\naccel_y: {d:.2}\nsound_on: {}\nsamples_per_phase_step: {d}",
+        .{ accel_x, accel_y, sound_toggle, samples_per_phase_step },
+    ) catch unreachable;
 
-    const len = std.mem.len(@as([*:0]u8, @ptrCast(&buf)));
-
+    const len = std.mem.sliceTo(&buf, 0).len;
     _ = playdate.graphics.drawText(&buf, len, .ASCIIEncoding, 0, 0);
 
     // returning 1 signals to the OS to draw the frame.
