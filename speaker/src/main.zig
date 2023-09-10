@@ -14,12 +14,12 @@ pub fn main() !void {
     if (in_device == c.paNoDevice) {
         @panic("No default input device!\n");
     }
-
+    const in_info = c.Pa_GetDeviceInfo(in_device);
     const in_params = c.PaStreamParameters{
         .device = in_device,
         .channelCount = @intCast(1),
         .sampleFormat = c.paFloat32 | c.paNonInterleaved,
-        .suggestedLatency = c.Pa_GetDeviceInfo(in_device).*.defaultLowInputLatency,
+        .suggestedLatency = in_info.*.defaultLowInputLatency,
         .hostApiSpecificStreamInfo = null,
     };
 
@@ -27,12 +27,12 @@ pub fn main() !void {
     if (out_device == c.paNoDevice) {
         @panic("No default output device!\n");
     }
-
+    const out_info = c.Pa_GetDeviceInfo(out_device);
     const out_params = c.PaStreamParameters{
         .device = out_device,
         .channelCount = @intCast(1),
         .sampleFormat = c.paFloat32 | c.paNonInterleaved,
-        .suggestedLatency = c.Pa_GetDeviceInfo(out_device).*.defaultLowOutputLatency,
+        .suggestedLatency = out_info.*.defaultLowOutputLatency,
         .hostApiSpecificStreamInfo = null,
     };
 
@@ -51,7 +51,7 @@ pub fn main() !void {
 
     paAssert(c.Pa_StartStream(stream));
 
-    std.log.info("listening for audio..", .{});
+    std.log.info("Relaying audio from {s} to {s}...", .{ in_info.*.name, out_info.*.name });
     while (true) {}
 }
 

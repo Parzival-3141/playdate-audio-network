@@ -40,11 +40,3 @@ Write your [Playdate](https://play.date) game in [Zig](https://ziglang.org)! Use
 1. When you quit out to the home menu, change the home menu to view as list and you should see the "Hello World Zig" program with a custom icon [like here](#home-screen-list-view).
 1. Optionally, connect your Playdate to the comupter and upload to the device by going to `Device` -> `Upload Game to Device..` in the Playdate Simulator.
    1. It should load and run on the hardware as well!
-
-## <a name="Screenshot"></a>Screenshot
-
-<img src="readme_res/screenshot.png" alt="isolated" width="400"/>
-
-## <a name="ListView"></a>Home Screen List View
-
-<img src="readme_res/listview.png" alt="isolated" width="400"/>

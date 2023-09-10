@@ -37,17 +37,18 @@ fn audioCallback(context: ?*anyopaque, left: [*c]i16, right: [*c]i16, len: c_int
     var btns: pdapi.PDButtons = undefined;
     playdate.system.getButtonState(&btns, null, null);
 
-    const zlen: usize = @intCast(len);
+    const ulen: usize = @intCast(len);
     if (btns.b) {
-        for (0..zlen) |i| {
+        for (0..ulen) |i| {
             const sign = 2 * @as(i16, @intCast((@divFloor(i, 100)) % 2)) - 1;
             left[i] = sign * (std.math.maxInt(i16) - 1);
             right[i] = sign * (std.math.maxInt(i16) - 1);
         }
     } else {
-        @memset(left[0..@intCast(len)], std.math.maxInt(i16) * @as(i16, @intFromBool(btns.b)));
-        @memset(right[0..@intCast(len)], std.math.maxInt(i16) * @as(i16, @intFromBool(btns.b)));
+        @memset(left[0..@intCast(len)], 0);
+        @memset(right[0..@intCast(len)], 0);
     }
+
     return 1;
 }
 
@@ -74,9 +75,6 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     var accel_x: f32 = undefined;
     var accel_y: f32 = undefined;
     playdate.system.getAccelerometer(&accel_x, &accel_y, null);
-
-    // const synth = playdate.sound.synth.newSynth();
-    // synth.
 
     var buf = [_]u8{0} ** 64;
     var fbs = std.io.fixedBufferStream(&buf);
