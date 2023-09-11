@@ -39,9 +39,13 @@ const step_size = 1;
 fn audioCallback(context: ?*anyopaque, left: [*c]i16, right: [*c]i16, len: c_int) callconv(.C) c_int {
     _ = context;
 
-    const full = std.math.maxInt(i16) - 1;
+    const full = std.math.maxInt(i16);
     const half = full / 2;
-    const table = [8]i16{ full, -full, 0, 0, half, -half, 0, 0 };
+
+    const full_neg = std.math.minInt(i16);
+    const half_neg = full_neg / 2;
+
+    const table = [8]i16{ full, full_neg, 0, 0, half, half_neg, 0, 0 };
 
     const ulen: usize = @intCast(len);
 

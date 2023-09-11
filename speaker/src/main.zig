@@ -18,7 +18,7 @@ pub fn main() !void {
     const in_params = c.PaStreamParameters{
         .device = in_device,
         .channelCount = @intCast(1),
-        .sampleFormat = c.paFloat32 | c.paNonInterleaved,
+        .sampleFormat = c.paInt16 | c.paNonInterleaved,
         .suggestedLatency = in_info.*.defaultLowInputLatency,
         .hostApiSpecificStreamInfo = null,
     };
@@ -31,7 +31,7 @@ pub fn main() !void {
     const out_params = c.PaStreamParameters{
         .device = out_device,
         .channelCount = @intCast(1),
-        .sampleFormat = c.paFloat32 | c.paNonInterleaved,
+        .sampleFormat = c.paInt16 | c.paNonInterleaved,
         .suggestedLatency = out_info.*.defaultLowOutputLatency,
         .hostApiSpecificStreamInfo = null,
     };
@@ -55,6 +55,9 @@ pub fn main() !void {
     while (true) {}
 }
 
+var high: i16 = 0;
+var low: i16 = 0;
+
 fn paCallback(
     in_buf: ?*const anyopaque,
     out_buf: ?*anyopaque,
@@ -67,19 +70,20 @@ fn paCallback(
     _ = status_flags;
     _ = time_info;
 
-    const ins: [*]const [*]const f32 = if (in_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
-    const outs: [*]const [*]f32 = if (out_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
+    const ins: [*]const [*]const i16 = if (in_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
+    const outs: [*]const [*]i16 = if (out_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
 
-    @memcpy(outs[0][0..@intCast(frame_count)], ins[0][0..@intCast(frame_count)]);
-
-    // var avg_sample_value: f32 = 0;
-    // for (ins[0][0..@intCast(frame_count)]) |sample| {
-    //     avg_sample_value += sample;
-    // }
-
-    // avg_sample_value /= @floatFromInt(frame_count);
-
-    // dbprint("avg. sample value: {d:.3}\n", .{avg_sample_value});
+    for (ins[0][0..@intCast(frame_count)], outs[0][0..@intCast(frame_count)]) |in, *out| {
+        if (in > high) {
+            high = in;
+            dbprint("high: {d} ({d:.3})\n", .{ high, @as(f32, @floatFromInt(high)) / std.math.maxInt(i16) });
+        }
+        if (in < low) {
+            low = in;
+            dbprint("low: {d} (-{d:.3})\n", .{ low, @as(f32, @floatFromInt(low)) / std.math.minInt(i16) });
+        }
+        out.* = in;
+    }
 
     return c.paContinue;
 }
