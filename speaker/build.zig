@@ -16,18 +16,13 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "speed-date",
+        .name = "server",
         // In this case the main source file is merely a path, however, in more
         // complicated build scripts, this could be a generated file.
         .root_source_file = .{ .path = "src/main.zig" },
         .target = target,
         .optimize = optimize,
     });
-
-    // This declares intent for the executable to be installed into the
-    // standard location when the user invokes the "install" step (the default
-    // step when running `zig build`).
-    b.installArtifact(exe);
 
     const portaudio_dep = b.dependency(
         "portaudio",
@@ -37,6 +32,32 @@ pub fn build(b: *std.Build) void {
     // exe.addModule("portaudio", portaudio_dep.module("portaudio"));
     // exe.installLibraryHeaders(portaudio_lib);
     exe.linkLibrary(portaudio_lib);
+
+    const olivec = b.addStaticLibrary(std.Build.StaticLibraryOptions{
+        .name = "olive.c",
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    olivec.addIncludePath(.{ .path = "deps/" });
+
+    olivec.addCSourceFile(.{ .file = .{ .path = "deps/olive.c" }, .flags = &.{} });
+    olivec.addCSourceFile(.{
+        .file = .{ .path = "deps/vc.c" },
+        .flags = &.{"-DVC_PLATFORM=VC_TERM_PLATFORM"},
+    });
+    // olivec.addCSourceFile(std.Build.CompileStep.CSourceFile{
+    //     .file = .{ .path = "deps/olive.c" },
+    //     .flags = &.{"-DOLIVEC_IMPLEMENTATION"},
+    // });
+
+    exe.addIncludePath(.{ .path = "deps/" });
+    exe.linkLibrary(olivec);
+
+    // This declares intent for the executable to be installed into the
+    // standard location when the user invokes the "install" step (the default
+    // step when running `zig build`).
+    b.installArtifact(exe);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish

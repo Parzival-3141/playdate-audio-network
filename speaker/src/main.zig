@@ -2,11 +2,41 @@ const std = @import("std");
 const dbprint = std.debug.print;
 const c = @cImport({
     @cInclude("portaudio.h");
+    // @cInclude("olive.c");
+    @cInclude("vc.c");
 });
 
 var stream: ?*c.PaStream = null;
 
-pub fn main() !void {
+const WIDTH = 800;
+const HEIGHT = 600;
+var pixels: [WIDTH * HEIGHT]u32 = undefined;
+
+const Color = packed struct(u32) {
+    red: u8 = 0,
+    green: u8 = 0,
+    blue: u8 = 0,
+    alpha: u8 = 0xFF,
+
+    pub const white: Color = @bitCast(@as(u32, 0xFFFFFFFF));
+};
+
+export fn vc_render() c.Olivec_Canvas {
+    var canvas = c.olivec_canvas(&pixels, WIDTH, HEIGHT, WIDTH);
+    c.olivec_fill(canvas, 0);
+    c.olivec_circle(
+        canvas,
+        WIDTH / 2,
+        HEIGHT / 2,
+        100,
+        @bitCast(Color.white),
+    );
+    return canvas;
+}
+
+pub extern fn main() callconv(.C) c_int;
+
+pub fn main2() !void {
     paAssert(c.Pa_Initialize());
     defer paAssert(c.Pa_Terminate());
 
@@ -70,8 +100,8 @@ fn paCallback(
     _ = status_flags;
     _ = time_info;
 
-    const ins: [*]const [*]const i16 = if (in_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
-    const outs: [*]const [*]i16 = if (out_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
+    const ins: [*]const [*]const i16 = @alignCast(@ptrCast(in_buf.?));
+    const outs: [*]const [*]i16 = @alignCast(@ptrCast(out_buf.?));
 
     for (ins[0][0..@intCast(frame_count)], outs[0][0..@intCast(frame_count)]) |in, *out| {
         if (in > high) {
