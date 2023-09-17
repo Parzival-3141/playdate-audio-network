@@ -4,6 +4,17 @@ const pdapi = @import("playdate_api_definitions.zig");
 var g_playdate_image: *pdapi.LCDBitmap = undefined;
 var playdate: *pdapi.PlaydateAPI = undefined;
 
+pub fn panic(msg: []const u8, stack_trace: ?*std.builtin.StackTrace, _: ?usize) noreturn {
+    _ = stack_trace;
+    @setCold(true);
+
+    var buf: [100]u8 = undefined;
+    const len = @min(buf.len - 1, msg.len);
+    @memcpy(buf[0..len], msg[0..len]);
+    buf[len] = 0;
+    playdate.system.@"error"(@ptrCast(&buf));
+}
+
 pub export fn eventHandler(_playdate: *pdapi.PlaydateAPI, event: pdapi.PDSystemEvent, arg: u32) callconv(.C) c_int {
     //TODO: replace with your own code!
     _ = arg;
@@ -32,33 +43,29 @@ fn menu_item(_: ?*anyopaque) callconv(.C) void {
 }
 
 var sound_toggle = false;
-var phase: u3 = 0;
-var total_len: usize = 0;
-var samples_per_phase_step: usize = 8;
-const step_size = 1;
+var phase: f32 = 0;
+var frequency: f32 = 110;
+var phase_incr: f32 = 110 / 44_100;
+var dc_amp: i16 = 0;
+
+const AudioGenerator = struct {
+    name: []const u8,
+    func: *const fn ([*]i16, [*]i16, u32) callconv(.C) void,
+};
+
+const audio_generators = [_]AudioGenerator{
+    .{ .name = "Sine", .func = generate_sine },
+    .{ .name = "DC", .func = generate_dc },
+};
+
+var current_audio_generator: u4 = 0;
+
 fn audioCallback(context: ?*anyopaque, left: [*c]i16, right: [*c]i16, len: c_int) callconv(.C) c_int {
     _ = context;
 
-    const full = std.math.maxInt(i16);
-    const half = full / 2;
-
-    const full_neg = std.math.minInt(i16);
-    const half_neg = full_neg / 2;
-
-    const table = [8]i16{ full, full_neg, 0, 0, half, half_neg, 0, 0 };
-
-    const ulen: usize = @intCast(len);
-
     if (sound_toggle) {
-        for (0..ulen) |i| {
-            left[i] = table[phase];
-            right[i] = table[phase];
-
-            total_len +%= 1;
-            if (total_len % samples_per_phase_step == 0) {
-                phase +%= 1;
-            }
-        }
+        const gen = audio_generators[current_audio_generator];
+        gen.func(left, right, @intCast(len));
     } else {
         @memset(left[0..@intCast(len)], 0);
         @memset(right[0..@intCast(len)], 0);
@@ -67,10 +74,24 @@ fn audioCallback(context: ?*anyopaque, left: [*c]i16, right: [*c]i16, len: c_int
     return 1;
 }
 
-fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
-    //TODO: replace with your own code!
+var current_amp: i16 = 0;
 
+fn recordCallback(_: ?*anyopaque, input: [*c]i16, len: c_int) callconv(.C) c_int {
+    const ulen: usize = @intCast(len);
+    const samples: [*]i16 = @ptrCast(input);
+    var max: i16 = 0;
+    for (samples[0..ulen]) |samp| {
+        var abs: i16 = samp;
+        if (abs < 0) abs = -abs;
+        max = @max(max, abs);
+    }
+    current_amp = @max(current_amp, max);
+    return 1;
+}
+
+fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     const to_draw = "Hello from Zig!";
+    const crank_angle = playdate.system.getCrankAngle();
 
     playdate.graphics.clear(@intFromEnum(pdapi.LCDSolidColor.ColorWhite));
     const pixel_width = playdate.graphics.drawText(to_draw, to_draw.len, .UTF8Encoding, pdapi.LCD_COLUMNS / 2 - 48, pdapi.LCD_ROWS / 2 + 48);
@@ -80,7 +101,7 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
         g_playdate_image,
         pdapi.LCD_COLUMNS / 2,
         pdapi.LCD_ROWS / 2,
-        playdate.system.getCrankAngle(),
+        crank_angle,
         0.5,
         0.5,
         2,
@@ -94,16 +115,32 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     var pushed: pdapi.PDButtons = undefined;
     playdate.system.getButtonState(null, &pushed, null);
 
+    if (pushed.left) current_audio_generator = @intCast((current_audio_generator -% 1) % audio_generators.len);
+    if (pushed.right) current_audio_generator = @intCast((current_audio_generator +% 1) % audio_generators.len);
+
     if (pushed.b) sound_toggle = !sound_toggle;
-    if (pushed.up) samples_per_phase_step += step_size;
-    if (pushed.down and samples_per_phase_step > step_size) samples_per_phase_step -= step_size;
+
+    if (playdate.system.isCrankDocked() == 0) {
+        frequency += playdate.system.getCrankChange() * 2;
+        frequency = std.math.clamp(frequency, 1, 20_000);
+        phase_incr = frequency / 44_100;
+
+        dc_amp = @intFromFloat((crank_angle / 180 - 1) * (std.math.maxInt(i16) - 1));
+    }
 
     var buf = [_]u8{0} ** 128;
     var fbs = std.io.fixedBufferStream(&buf);
+
     fbs.writer().print(
-        "accel_x: {d:.2}\naccel_y: {d:.2}\nsound_on: {}\nsamples_per_phase_step: {d}",
-        .{ accel_x, accel_y, sound_toggle, samples_per_phase_step },
+        "accel_x: {d:.2}\naccel_y: {d:.2}\nsound_on: {}\ngenerator: {s}\n",
+        .{ accel_x, accel_y, sound_toggle, audio_generators[current_audio_generator].name },
     ) catch unreachable;
+    fbs.writer().print(
+        "frequency: {d:.0}\nDC amp: {d}\n",
+        .{ frequency, dc_amp },
+    ) catch unreachable;
+
+    current_amp = 0;
 
     const len = std.mem.sliceTo(&buf, 0).len;
     _ = playdate.graphics.drawText(&buf, len, .ASCIIEncoding, 0, 0);
@@ -112,3 +149,38 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     // we always want this frame drawn
     return 1;
 }
+
+fn generate_dc(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
+    for (0..count) |i| {
+        left[i] = dc_amp;
+        right[i] = 0;
+    }
+}
+
+fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
+    for (0..count) |i| {
+        const index_float = phase * sin_tab.len;
+        const index: u32 = @intFromFloat(index_float);
+        const frac = index_float - @as(f32, @floatFromInt(index));
+
+        const y1 = sin_tab[index % sin_tab.len];
+        const y2 = sin_tab[(index + 1) % sin_tab.len];
+        const out_float = y1 * (1 - frac) + (y2 * frac);
+        const out: i16 = @intFromFloat(out_float * @as(f32, @floatFromInt((std.math.maxInt(i16) - 1))));
+
+        left[i] = out;
+        right[i] = 0;
+
+        phase += phase_incr;
+        while (phase >= 1) phase -= 1;
+        while (phase < 0) phase += 1;
+    }
+}
+
+const sin_tab = blk: {
+    var vals: [64]f32 = undefined;
+    for (&vals, 0..) |*v, i| {
+        v.* = @floatCast(@sin(i / @as(f64, vals.len) * std.math.pi * 2));
+    }
+    break :blk vals;
+};

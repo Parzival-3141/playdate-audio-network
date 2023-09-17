@@ -86,7 +86,7 @@ pub const PlaydateSys = extern struct {
     realloc: *const fn (ptr: ?*anyopaque, size: usize) callconv(.C) ?*anyopaque,
     formatString: *const fn (ret: *?[*:0]u8, fmt: [*:0]const u8, ...) callconv(.C) c_int,
     logToConsole: *const fn (fmt: [*:0]const u8, ...) callconv(.C) void,
-    @"error": *const fn (fmt: [*:0]const u8, ...) callconv(.C) void,
+    @"error": *const fn (fmt: [*:0]const u8, ...) callconv(.C) noreturn,
     getLanguage: *const fn () callconv(.C) PDLanguage,
     getCurrentTimeMilliseconds: *const fn () callconv(.C) c_uint,
     getSecondsSinceEpoch: *const fn (milliseconds: ?*c_uint) callconv(.C) c_uint,
