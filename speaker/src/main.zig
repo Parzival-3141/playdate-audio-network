@@ -21,13 +21,29 @@ const Color = packed struct(u32) {
     pub const white: Color = @bitCast(@as(u32, 0xFFFFFFFF));
 };
 
+var last_time = 0;
+var timer: ?std.time.Timer = null;
+
+var x: f32 = 0;
+var y: f32 = 0;
 export fn vc_render() c.Olivec_Canvas {
+    const dt = if (timer) |*t| t.lap() else blk: {
+        timer = std.time.Timer.start() catch @panic("No timer :(");
+        break :blk timer.?.read();
+    };
+
     var canvas = c.olivec_canvas(&pixels, WIDTH, HEIGHT, WIDTH);
-    c.olivec_fill(canvas, 0);
+    c.olivec_fill(canvas, @bitCast(Color{}));
+
+    x += @as(f32, @floatFromInt(dt)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    y += @as(f32, @floatFromInt(dt)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+    const sin = (WIDTH / 3) * @sin(x);
+    const cos = (HEIGHT / 3) * @cos(y);
+
     c.olivec_circle(
         canvas,
-        WIDTH / 2,
-        HEIGHT / 2,
+        @intFromFloat((WIDTH / 2) + cos),
+        @intFromFloat((HEIGHT / 2) + sin),
         100,
         @bitCast(Color.white),
     );
