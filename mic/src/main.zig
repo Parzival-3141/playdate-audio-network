@@ -43,49 +43,58 @@ fn menu_item(_: ?*anyopaque) callconv(.C) void {
 }
 
 var sound_toggle = false;
-var phase: f32 = 0;
-var frequency: f32 = 110;
-var phase_incr: f32 = 110 / 44_100;
-var dc_amp: i16 = 0;
 
-const AudioGenerator = struct {
-    name: []const u8,
-    func: *const fn ([*]i16, [*]i16, u32) callconv(.C) void,
+const sample_rate: f32 = 44_100;
+const block_size = 9;
+const base_signal_frequency = sample_rate / block_size;
+
+var oscillators = [2]Oscillator{
+    Oscillator.init(base_signal_frequency * 1, base_signal_frequency * 2),
+    Oscillator.init(base_signal_frequency * 3, base_signal_frequency * 4),
 };
 
-const audio_generators = [_]AudioGenerator{
-    .{ .name = "Sine", .func = generate_sine },
-    .{ .name = "DC", .func = generate_dc },
+const test_bit_pattern = [8][2]u1{
+    .{ 0, 0 },
+    .{ 1, 0 },
+    .{ 1, 1 },
+    .{ 0, 1 },
+    .{ 1, 0 },
+    .{ 1, 0 },
+    .{ 1, 1 },
+    .{ 1, 1 },
 };
-
-var current_audio_generator: u4 = 0;
+var bit_pattern_index: u3 = 0;
+var sample_counter: u16 = 0;
 
 fn audioCallback(context: ?*anyopaque, left: [*c]i16, right: [*c]i16, len: c_int) callconv(.C) c_int {
     _ = context;
 
     if (sound_toggle) {
-        const gen = audio_generators[current_audio_generator];
-        gen.func(left, right, @intCast(len));
+        const ulen: u32 = @intCast(len);
+        for (left, 0..ulen) |*buf, _| {
+            const bits = test_bit_pattern[bit_pattern_index];
+
+            // Mix output of each oscillator.
+            var amp: f32 = 0;
+            for (&oscillators, bits) |*osc, b| {
+                amp += osc.generate_sample(b == 1);
+            }
+
+            const out: i16 = @intFromFloat(amp * @as(f32, @floatFromInt((std.math.maxInt(i16) - 1))));
+            buf.* = out;
+
+            // Every block_size samples, move to next bit.
+            sample_counter += 1;
+            if (sample_counter > block_size) {
+                sample_counter = 0;
+                bit_pattern_index +%= 1;
+            }
+        }
     } else {
         @memset(left[0..@intCast(len)], 0);
         @memset(right[0..@intCast(len)], 0);
     }
 
-    return 1;
-}
-
-var current_amp: i16 = 0;
-
-fn recordCallback(_: ?*anyopaque, input: [*c]i16, len: c_int) callconv(.C) c_int {
-    const ulen: usize = @intCast(len);
-    const samples: [*]i16 = @ptrCast(input);
-    var max: i16 = 0;
-    for (samples[0..ulen]) |samp| {
-        var abs: i16 = samp;
-        if (abs < 0) abs = -abs;
-        max = @max(max, abs);
-    }
-    current_amp = @max(current_amp, max);
     return 1;
 }
 
@@ -115,32 +124,15 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     var pushed: pdapi.PDButtons = undefined;
     playdate.system.getButtonState(null, &pushed, null);
 
-    if (pushed.left) current_audio_generator = @intCast((current_audio_generator -% 1) % audio_generators.len);
-    if (pushed.right) current_audio_generator = @intCast((current_audio_generator +% 1) % audio_generators.len);
-
     if (pushed.b) sound_toggle = !sound_toggle;
-
-    if (playdate.system.isCrankDocked() == 0) {
-        frequency += playdate.system.getCrankChange() * 2;
-        frequency = std.math.clamp(frequency, 1, 20_000);
-        phase_incr = frequency / 44_100;
-
-        dc_amp = @intFromFloat((crank_angle / 180 - 1) * (std.math.maxInt(i16) - 1));
-    }
 
     var buf = [_]u8{0} ** 128;
     var fbs = std.io.fixedBufferStream(&buf);
 
     fbs.writer().print(
-        "accel_x: {d:.2}\naccel_y: {d:.2}\nsound_on: {}\ngenerator: {s}\n",
-        .{ accel_x, accel_y, sound_toggle, audio_generators[current_audio_generator].name },
+        "accel_x: {d:.2}\naccel_y: {d:.2}\nsound_on: {}\n",
+        .{ accel_x, accel_y, sound_toggle },
     ) catch unreachable;
-    fbs.writer().print(
-        "frequency: {d:.0}\nDC amp: {d}\n",
-        .{ frequency, dc_amp },
-    ) catch unreachable;
-
-    current_amp = 0;
 
     const len = std.mem.sliceTo(&buf, 0).len;
     _ = playdate.graphics.drawText(&buf, len, .ASCIIEncoding, 0, 0);
@@ -150,37 +142,50 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     return 1;
 }
 
-fn generate_dc(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
-    for (0..count) |i| {
-        left[i] = dc_amp;
-        right[i] = 0;
-    }
-}
+/// Stateful sine wave oscillator.
+const Oscillator = struct {
+    /// The amount to increase the phase on each sample.
+    /// Equals frequency / sample_rate.
+    /// Index 0 is increment for low frequency, index 1 for high.
+    phase_incr: [2]f32,
+    /// Current phase; changes every sample.
+    phase: f32,
 
-fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
-    for (0..count) |i| {
-        const index_float = phase * sin_tab.len;
-        const index: u32 = @intFromFloat(index_float);
+    fn init(low_freq: f32, high_freq: f32) Oscillator {
+        if (low_freq <= 0 or high_freq <= 0) {
+            @panic("frequencies must be > 0");
+        }
+        return .{
+            .phase_incr = .{ low_freq / sample_rate, high_freq / sample_rate },
+            .phase = 0,
+        };
+    }
+
+    /// Calculates the next amplitude value and updates phase.
+    /// If high is true, generates at high frequency, otherwise at low frequency.
+    fn generate_sample(osc: *Oscillator, high: bool) f32 {
+        const index_float = osc.phase * sin_tab.len;
+        const index: u8 = @intFromFloat(index_float);
         const frac = index_float - @as(f32, @floatFromInt(index));
 
         const y1 = sin_tab[index % sin_tab.len];
         const y2 = sin_tab[(index + 1) % sin_tab.len];
-        const out_float = y1 * (1 - frac) + (y2 * frac);
-        const out: i16 = @intFromFloat(out_float * @as(f32, @floatFromInt((std.math.maxInt(i16) - 1))));
+        const out = y1 * (1 - frac) + (y2 * frac);
 
-        left[i] = out;
-        right[i] = 0;
+        osc.phase += osc.phase_incr[@intFromBool(high)];
+        while (osc.phase >= 1) osc.phase -= 1;
 
-        phase += phase_incr;
-        while (phase >= 1) phase -= 1;
-        while (phase < 0) phase += 1;
+        return out;
     }
-}
+};
 
 const sin_tab = blk: {
     var vals: [64]f32 = undefined;
     for (&vals, 0..) |*v, i| {
         v.* = @floatCast(@sin(i / @as(f64, vals.len) * std.math.pi * 2));
+        // Attenuate source lookup table so multiple oscillators
+        // won't exceed 1.0 when mixed.
+        v.* /= oscillators.len;
     }
     break :blk vals;
 };
