@@ -27,19 +27,10 @@ pub fn main() !void {
     if (out_device == c.paNoDevice) {
         @panic("No default output device!\n");
     }
-    // const out_info = c.Pa_GetDeviceInfo(out_device);
-    // const out_params = c.PaStreamParameters{
-    //     .device = out_device,
-    //     .channelCount = @intCast(1),
-    //     .sampleFormat = c.paFloat32 | c.paNonInterleaved,
-    //     .suggestedLatency = out_info.*.defaultLowOutputLatency,
-    //     .hostApiSpecificStreamInfo = null,
-    // };
 
     paAssert(c.Pa_OpenStream(
         &stream,
         &in_params,
-        // &out_params,
         null,
         44_100,
         c.paFramesPerBufferUnspecified,
@@ -127,6 +118,18 @@ fn paCallback(
 
     return c.paContinue;
 }
+
+const sin_tab = blk: {
+    var vals: [256]f32 = undefined;
+    for (&vals, 0..) |*v, i| {
+        v.* = @floatCast(@sin(i / @as(f64, vals.len) * std.math.pi * 2));
+    }
+    break :blk vals;
+};
+
+var phase: f32 = 0;
+const frequency: f32 = 19_294;
+var phase_incr: f32 = frequency / 44_100.0;
 
 fn paAssert(code: c.PaError) void {
     if (code != c.paNoError) {

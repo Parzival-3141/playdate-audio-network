@@ -4,6 +4,17 @@ const pdapi = @import("playdate_api_definitions.zig");
 var g_playdate_image: *pdapi.LCDBitmap = undefined;
 var playdate: *pdapi.PlaydateAPI = undefined;
 
+pub fn panic(msg: []const u8, stack_trace: ?*std.builtin.StackTrace, _: ?usize) noreturn {
+    _ = stack_trace;
+    @setCold(true);
+
+    var buf: [100]u8 = undefined;
+    const len = @min(buf.len - 1, msg.len);
+    @memcpy(buf[0..len], msg[0..len]);
+    buf[len] = 0;
+    playdate.system.@"error"(@ptrCast(&buf));
+}
+
 pub export fn eventHandler(_playdate: *pdapi.PlaydateAPI, event: pdapi.PDSystemEvent, arg: u32) callconv(.C) c_int {
     //TODO: replace with your own code!
     _ = arg;
@@ -32,31 +43,51 @@ fn menu_item(_: ?*anyopaque) callconv(.C) void {
 }
 
 var sound_toggle = false;
-var phase: u3 = 0;
-var total_len: usize = 0;
-var samples_per_phase_step: usize = 8;
-const step_size = 1;
+
+const sample_rate: f32 = 44_100;
+const block_size = 9;
+const base_signal_frequency = sample_rate / block_size;
+
+var oscillators = [2]Oscillator{
+    Oscillator.init(base_signal_frequency * 1, base_signal_frequency * 2),
+    Oscillator.init(base_signal_frequency * 3, base_signal_frequency * 4),
+};
+
+const test_bit_pattern = [8][2]u1{
+    .{ 0, 0 },
+    .{ 1, 0 },
+    .{ 1, 1 },
+    .{ 0, 1 },
+    .{ 1, 0 },
+    .{ 1, 0 },
+    .{ 1, 1 },
+    .{ 1, 1 },
+};
+var bit_pattern_index: u3 = 0;
+var sample_counter: u16 = 0;
+
 fn audioCallback(context: ?*anyopaque, left: [*c]i16, right: [*c]i16, len: c_int) callconv(.C) c_int {
     _ = context;
 
-    const full = std.math.maxInt(i16);
-    const half = full / 2;
-
-    const full_neg = std.math.minInt(i16);
-    const half_neg = full_neg / 2;
-
-    const table = [8]i16{ full, full_neg, 0, 0, half, half_neg, 0, 0 };
-
-    const ulen: usize = @intCast(len);
-
     if (sound_toggle) {
-        for (0..ulen) |i| {
-            left[i] = table[phase];
-            right[i] = table[phase];
+        const ulen: u32 = @intCast(len);
+        for (left, 0..ulen) |*buf, _| {
+            const bits = test_bit_pattern[bit_pattern_index];
 
-            total_len +%= 1;
-            if (total_len % samples_per_phase_step == 0) {
-                phase +%= 1;
+            // Mix output of each oscillator.
+            var amp: f32 = 0;
+            for (&oscillators, bits) |*osc, b| {
+                amp += osc.generate_sample(b == 1);
+            }
+
+            const out: i16 = @intFromFloat(amp * @as(f32, @floatFromInt((std.math.maxInt(i16) - 1))));
+            buf.* = out;
+
+            // Every block_size samples, move to next bit.
+            sample_counter += 1;
+            if (sample_counter > block_size) {
+                sample_counter = 0;
+                bit_pattern_index +%= 1;
             }
         }
     } else {
@@ -68,9 +99,8 @@ fn audioCallback(context: ?*anyopaque, left: [*c]i16, right: [*c]i16, len: c_int
 }
 
 fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
-    //TODO: replace with your own code!
-
     const to_draw = "Hello from Zig!";
+    const crank_angle = playdate.system.getCrankAngle();
 
     playdate.graphics.clear(@intFromEnum(pdapi.LCDSolidColor.ColorWhite));
     const pixel_width = playdate.graphics.drawText(to_draw, to_draw.len, .UTF8Encoding, pdapi.LCD_COLUMNS / 2 - 48, pdapi.LCD_ROWS / 2 + 48);
@@ -80,7 +110,7 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
         g_playdate_image,
         pdapi.LCD_COLUMNS / 2,
         pdapi.LCD_ROWS / 2,
-        playdate.system.getCrankAngle(),
+        crank_angle,
         0.5,
         0.5,
         2,
@@ -95,14 +125,13 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     playdate.system.getButtonState(null, &pushed, null);
 
     if (pushed.b) sound_toggle = !sound_toggle;
-    if (pushed.up) samples_per_phase_step += step_size;
-    if (pushed.down and samples_per_phase_step > step_size) samples_per_phase_step -= step_size;
 
     var buf = [_]u8{0} ** 128;
     var fbs = std.io.fixedBufferStream(&buf);
+
     fbs.writer().print(
-        "accel_x: {d:.2}\naccel_y: {d:.2}\nsound_on: {}\nsamples_per_phase_step: {d}",
-        .{ accel_x, accel_y, sound_toggle, samples_per_phase_step },
+        "accel_x: {d:.2}\naccel_y: {d:.2}\nsound_on: {}\n",
+        .{ accel_x, accel_y, sound_toggle },
     ) catch unreachable;
 
     const len = std.mem.sliceTo(&buf, 0).len;
@@ -112,3 +141,51 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     // we always want this frame drawn
     return 1;
 }
+
+/// Stateful sine wave oscillator.
+const Oscillator = struct {
+    /// The amount to increase the phase on each sample.
+    /// Equals frequency / sample_rate.
+    /// Index 0 is increment for low frequency, index 1 for high.
+    phase_incr: [2]f32,
+    /// Current phase; changes every sample.
+    phase: f32,
+
+    fn init(low_freq: f32, high_freq: f32) Oscillator {
+        if (low_freq <= 0 or high_freq <= 0) {
+            @panic("frequencies must be > 0");
+        }
+        return .{
+            .phase_incr = .{ low_freq / sample_rate, high_freq / sample_rate },
+            .phase = 0,
+        };
+    }
+
+    /// Calculates the next amplitude value and updates phase.
+    /// If high is true, generates at high frequency, otherwise at low frequency.
+    fn generate_sample(osc: *Oscillator, high: bool) f32 {
+        const index_float = osc.phase * sin_tab.len;
+        const index: u8 = @intFromFloat(index_float);
+        const frac = index_float - @as(f32, @floatFromInt(index));
+
+        const y1 = sin_tab[index % sin_tab.len];
+        const y2 = sin_tab[(index + 1) % sin_tab.len];
+        const out = y1 * (1 - frac) + (y2 * frac);
+
+        osc.phase += osc.phase_incr[@intFromBool(high)];
+        while (osc.phase >= 1) osc.phase -= 1;
+
+        return out;
+    }
+};
+
+const sin_tab = blk: {
+    var vals: [64]f32 = undefined;
+    for (&vals, 0..) |*v, i| {
+        v.* = @floatCast(@sin(i / @as(f64, vals.len) * std.math.pi * 2));
+        // Attenuate source lookup table so multiple oscillators
+        // won't exceed 1.0 when mixed.
+        v.* /= oscillators.len;
+    }
+    break :blk vals;
+};
