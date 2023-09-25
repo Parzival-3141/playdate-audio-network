@@ -45,7 +45,6 @@ fn menu_item(_: ?*anyopaque) callconv(.C) void {
 var sound_toggle = false;
 var phase: f32 = 0;
 var frequency: f32 = 110;
-var phase_incr: f32 = 110 / 44_100;
 var dc_amp: i16 = 0;
 
 const AudioGenerator = struct {
@@ -55,6 +54,7 @@ const AudioGenerator = struct {
 
 const audio_generators = [_]AudioGenerator{
     .{ .name = "Sine", .func = generate_sine },
+    .{ .name = "Sine sequence", .func = generate_sine_sequence },
     .{ .name = "DC", .func = generate_dc },
 };
 
@@ -117,13 +117,14 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
 
     if (pushed.left) current_audio_generator = @intCast((current_audio_generator -% 1) % audio_generators.len);
     if (pushed.right) current_audio_generator = @intCast((current_audio_generator +% 1) % audio_generators.len);
+    if (pushed.up and sequence_periods_index < sequence_periods.len - 1) sequence_periods_index += 1;
+    if (pushed.down and sequence_periods_index > 0) sequence_periods_index -= 1;
 
     if (pushed.b) sound_toggle = !sound_toggle;
 
     if (playdate.system.isCrankDocked() == 0) {
         frequency += playdate.system.getCrankChange() * 2;
         frequency = std.math.clamp(frequency, 1, 20_000);
-        phase_incr = frequency / 44_100;
 
         dc_amp = @intFromFloat((crank_angle / 180 - 1) * (std.math.maxInt(i16) - 1));
     }
@@ -136,8 +137,8 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
         .{ accel_x, accel_y, sound_toggle, audio_generators[current_audio_generator].name },
     ) catch unreachable;
     fbs.writer().print(
-        "frequency: {d:.0}\nDC amp: {d}\n",
-        .{ frequency, dc_amp },
+        "frequency: {d:.0}\nDC amp: {d}\nsequence period: {d}",
+        .{ frequency, dc_amp, sequence_periods[sequence_periods_index] },
     ) catch unreachable;
 
     current_amp = 0;
@@ -157,23 +158,55 @@ fn generate_dc(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     }
 }
 
+fn generate_sine_sample(out: *i16, incr: f32) void {
+    const index_float = phase * sin_tab.len;
+    const index: u32 = @intFromFloat(index_float);
+    const frac = index_float - @as(f32, @floatFromInt(index));
+
+    const y1 = sin_tab[index % sin_tab.len];
+    const y2 = sin_tab[(index + 1) % sin_tab.len];
+    const out_float = y1 * (1 - frac) + (y2 * frac);
+    out.* = @intFromFloat(out_float * @as(f32, @floatFromInt((std.math.maxInt(i16) - 1))));
+
+    phase += incr;
+    while (phase >= 1) phase -= 1;
+    while (phase < 0) phase += 1;
+}
+
 fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
-    for (0..count) |i| {
-        const index_float = phase * sin_tab.len;
-        const index: u32 = @intFromFloat(index_float);
-        const frac = index_float - @as(f32, @floatFromInt(index));
+    for (left[0..count], right[0..count]) |*out, *dead| {
+        generate_sine_sample(out, frequency / 44_100);
+        dead.* = 0;
+    }
+}
 
-        const y1 = sin_tab[index % sin_tab.len];
-        const y2 = sin_tab[(index + 1) % sin_tab.len];
-        const out_float = y1 * (1 - frac) + (y2 * frac);
-        const out: i16 = @intFromFloat(out_float * @as(f32, @floatFromInt((std.math.maxInt(i16) - 1))));
+/// Changed via D-pad input.
+var sequence_periods_index: u8 = 0;
+/// How many samples a single frequency is held.
+const sequence_periods = [_]u32{
+    9,    18,   32,   64,    128,   256,   512,
+    1024, 2756, 5512, 11025, 22050, 44100, 88200,
+};
 
-        left[i] = out;
-        right[i] = 0;
+/// For each step in the sequence, multiply the base frequency by the corresponding element.
+const frequency_multiplier_sequence = [_]f32{ 1, 3, 2, 4 };
+/// Where we are in the sequence.
+var frequency_multiplier_index: u8 = 0;
+/// Total sample accumulator; when this reaches the current period len,
+/// reset to zero and move to next multiplier in the sequence.
+var sample_count: usize = 0;
 
-        phase += phase_incr;
-        while (phase >= 1) phase -= 1;
-        while (phase < 0) phase += 1;
+fn generate_sine_sequence(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
+    for (left[0..count], right[0..count]) |*out, *dead| {
+        const mul = frequency_multiplier_sequence[frequency_multiplier_index];
+        const incr = (frequency / 44_100) * mul;
+        generate_sine_sample(out, incr);
+        dead.* = 0;
+        sample_count += 1;
+        if (sample_count >= sequence_periods[sequence_periods_index]) {
+            frequency_multiplier_index = @intCast((frequency_multiplier_index + 1) % frequency_multiplier_sequence.len);
+            sample_count = 0;
+        }
     }
 }
 
