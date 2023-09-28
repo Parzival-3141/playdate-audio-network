@@ -18,7 +18,7 @@ pub fn main() !void {
     const in_params = c.PaStreamParameters{
         .device = in_device,
         .channelCount = @intCast(1),
-        .sampleFormat = c.paInt16 | c.paNonInterleaved,
+        .sampleFormat = c.paFloat32 | c.paNonInterleaved,
         .suggestedLatency = in_info.*.defaultLowInputLatency,
         .hostApiSpecificStreamInfo = null,
     };
@@ -31,7 +31,7 @@ pub fn main() !void {
     const out_params = c.PaStreamParameters{
         .device = out_device,
         .channelCount = @intCast(2),
-        .sampleFormat = c.paInt16 | c.paNonInterleaved,
+        .sampleFormat = c.paFloat32 | c.paNonInterleaved,
         .suggestedLatency = out_info.*.defaultLowOutputLatency,
         .hostApiSpecificStreamInfo = null,
     };
@@ -100,15 +100,15 @@ fn paCallback(
     _ = status_flags;
     _ = time_info;
 
-    const ins: [*]const [*]const i16 = if (in_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
-    const outs: [*]const [*]i16 = if (out_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
+    const ins: [*]const [*]const f32 = if (in_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
+    const outs: [*]const [*]f32 = if (out_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
 
     // Silence output
     @memset(outs[0][0..frame_count], 0);
     @memset(outs[1][0..frame_count], 0);
 
     for (0..frame_count) |i| {
-        goertzel_buffer[sample_counter] = convertSample(ins[0][i]);
+        goertzel_buffer[sample_counter] = ins[0][i];
         sample_counter += 1;
         if (sample_counter == goertzel_N) {
             sample_counter = 0;
@@ -128,10 +128,6 @@ fn paCallback(
     }
 
     return c.paContinue;
-}
-
-fn convertSample(val: i16) f32 {
-    return @as(f32, @floatFromInt(val)) / @as(f32, @floatFromInt(std.math.maxInt(i16) - 1));
 }
 
 /// Calculates the power of the given frequency within the input sample slice.
