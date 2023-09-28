@@ -75,13 +75,16 @@ pub fn main() !void {
 var high: i16 = 0;
 var low: i16 = 0;
 
-const sample_rate = 44_100;
-const goertzel_N = 9;
-const goertzel_detect_frequencies = [_]f32{
-    sample_rate / @as(f32, goertzel_N) * 1,
-    sample_rate / @as(f32, goertzel_N) * 2,
-    sample_rate / @as(f32, goertzel_N) * 3,
-    sample_rate / @as(f32, goertzel_N) * 4,
+const sample_rate: f32 = 44_100;
+const goertzel_N = 36;
+const goertzel_detect_frequencies = blk: {
+    comptime var freqs: []const f32 = &[0]f32{};
+    const base_freq = sample_rate / @as(f32, goertzel_N);
+    var f = base_freq;
+    while (f < 20_000) : (f += base_freq) {
+        freqs = freqs ++ &[1]f32{f};
+    }
+    break :blk freqs;
 };
 var sample_counter: u32 = 0;
 var goertzel_buffer: [goertzel_N]f32 = undefined;
