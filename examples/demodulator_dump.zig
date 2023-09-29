@@ -4,7 +4,7 @@ const c = @cImport({
     @cInclude("portaudio.h");
 });
 
-const demodulator = @import("demodulator.zig");
+const demodulator = @import("modem").demodulator;
 
 var stream: ?*c.PaStream = null;
 
