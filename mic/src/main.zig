@@ -55,6 +55,7 @@ const AudioGenerator = struct {
 const audio_generators = [_]AudioGenerator{
     .{ .name = "Sine", .func = generate_sine },
     .{ .name = "Sine sequence", .func = generate_sine_sequence },
+    .{ .name = "Modulated data", .func = generate_modulated_data },
     .{ .name = "DC", .func = generate_dc },
 };
 
@@ -151,6 +152,10 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     return 1;
 }
 
+fn convert_sample(x: f32) i16 {
+    return @intFromFloat(x * @as(f32, @floatFromInt((std.math.maxInt(i16) - 1))));
+}
+
 fn generate_dc(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     for (0..count) |i| {
         left[i] = dc_amp;
@@ -166,7 +171,7 @@ fn generate_sine_sample(out: *i16, incr: f32) void {
     const y1 = sin_tab[index % sin_tab.len];
     const y2 = sin_tab[(index + 1) % sin_tab.len];
     const out_float = y1 * (1 - frac) + (y2 * frac);
-    out.* = @intFromFloat(out_float * @as(f32, @floatFromInt((std.math.maxInt(i16) - 1))));
+    out.* = convert_sample(out_float);
 
     phase += incr;
     while (phase >= 1) phase -= 1;
@@ -180,11 +185,56 @@ fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     }
 }
 
+const modulator_N = 36;
+const modulator_base_freq = 44_100.0 / modulator_N;
+const Modulator = @import("modulator.zig").Modulator(1, &.{
+    .{ modulator_base_freq * 1, modulator_base_freq * 2 },
+    .{ modulator_base_freq * 3, modulator_base_freq * 4 },
+    .{ modulator_base_freq * 5, modulator_base_freq * 6 },
+    .{ modulator_base_freq * 7, modulator_base_freq * 8 },
+    .{ modulator_base_freq * 9, modulator_base_freq * 10 },
+    .{ modulator_base_freq * 11, modulator_base_freq * 12 },
+    .{ modulator_base_freq * 13, modulator_base_freq * 14 },
+    .{ modulator_base_freq * 15, modulator_base_freq * 16 },
+}, 44_100, 64);
+var modulator = Modulator.init();
+var modulator_sample_count: u16 = 0;
+const modulator_data: []const u8 =
+    \\One morning, as Gregor Samsa was waking up from anxious dreams, he
+    \\discovered that in bed he had been changed into a monstrous vermin.
+    \\He lay on his armour-hard back and saw, as he lifted his head up a little,
+    \\his brown, arched abdomen divided up into rigid bow-like sections.
+    \\From this height the blanket, just about ready to slide off completely,
+    \\could hardly stay in place. His numerous legs, pitifully thin in comparis-
+    \\on to the rest of his circumference, flickered helplessly before his eyes.
+    \\
+    \\
+;
+var modulator_data_index: u16 = modulator_data.len;
+
+fn generate_modulated_data(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
+    for (left[0..count], right[0..count]) |*out, *dead| {
+        var mixed: f32 = 0;
+        const vals = modulator.generate_sample();
+        for (vals) |v| mixed += v;
+        out.* = convert_sample(mixed * 0.125);
+
+        dead.* = 0;
+
+        modulator_sample_count += 1;
+        if (modulator_sample_count >= sequence_periods[sequence_periods_index]) {
+            modulator_data_index = @intCast((modulator_data_index + 1) % modulator_data.len);
+            modulator.symbol = @bitCast(modulator_data[modulator_data_index]);
+            modulator_sample_count = 0;
+        }
+    }
+}
+
 /// Changed via D-pad input.
 var sequence_periods_index: u8 = 0;
 /// How many samples a single frequency is held.
 const sequence_periods = [_]u32{
-    9,    18,   32,   64,    128,   256,   512,
+    9,    18,   36,   72,    128,   256,   512,
     1024, 2756, 5512, 11025, 22050, 44100, 88200,
 };
 
@@ -194,7 +244,7 @@ const frequency_multiplier_sequence = [_]f32{ 1, 3, 2, 4 };
 var frequency_multiplier_index: u8 = 0;
 /// Total sample accumulator; when this reaches the current period len,
 /// reset to zero and move to next multiplier in the sequence.
-var sample_count: usize = 0;
+var seq_sample_count: usize = 0;
 
 fn generate_sine_sequence(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     for (left[0..count], right[0..count]) |*out, *dead| {
@@ -202,10 +252,10 @@ fn generate_sine_sequence(left: [*]i16, right: [*]i16, count: u32) callconv(.C) 
         const incr = (frequency / 44_100) * mul;
         generate_sine_sample(out, incr);
         dead.* = 0;
-        sample_count += 1;
-        if (sample_count >= sequence_periods[sequence_periods_index]) {
+        seq_sample_count += 1;
+        if (seq_sample_count >= sequence_periods[sequence_periods_index]) {
             frequency_multiplier_index = @intCast((frequency_multiplier_index + 1) % frequency_multiplier_sequence.len);
-            sample_count = 0;
+            seq_sample_count = 0;
         }
     }
 }
