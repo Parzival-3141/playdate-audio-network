@@ -4,6 +4,8 @@ const c = @cImport({
     @cInclude("portaudio.h");
 });
 
+const demodulator = @import("demodulator.zig");
+
 var stream: ?*c.PaStream = null;
 
 pub fn main() !void {
@@ -49,6 +51,11 @@ pub fn main() !void {
 
     paAssert(c.Pa_StartStream(stream));
 
+    // visualize_goertzel();
+    dump_bitstream();
+}
+
+fn visualize_goertzel() void {
     while (true) {
         for (goertzel_detect_frequencies, goertzel_powers) |freq, pow| {
             const max_stars = 40;
@@ -72,6 +79,32 @@ pub fn main() !void {
     }
 }
 
+fn dump_bitstream() void {
+    var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
+
+    while (true) {
+        while (demodulated_data_read_pos != demodulated_data_write_pos) {
+            const full = demodulated_data_write_pos + 1 == demodulated_data_read_pos or
+                (demodulated_data_write_pos + 1 == demodulated_data_ring_buf.len and
+                demodulated_data_read_pos == 0);
+            if (full) {
+                // For now, just drop this symbol
+                break;
+            }
+
+            @fence(.AcqRel); // TODO: use most appropriate ordering
+            const byte = demodulated_data_ring_buf[demodulated_data_read_pos];
+            bw.writer().print("{c}", .{byte}) catch {};
+
+            @fence(.AcqRel); // TODO
+            demodulated_data_read_pos = @intCast((demodulated_data_read_pos + 1) % demodulated_data_ring_buf.len);
+        }
+
+        bw.flush() catch {};
+        std.time.sleep(1 * std.time.ns_per_ms);
+    }
+}
+
 var high: i16 = 0;
 var low: i16 = 0;
 
@@ -87,9 +120,26 @@ const goertzel_detect_frequencies = blk: {
     break :blk freqs;
 };
 var sample_counter: u32 = 0;
-var goertzel_buffer: [goertzel_N]f32 = undefined;
+var goertzel_buffer: [72]f32 = undefined;
 var goertzel_powers = [1]f32{0} ** goertzel_detect_frequencies.len;
 var goertzel_strongest_freq_index: usize = 0;
+
+const demodulator_base_freq = sample_rate / goertzel_N;
+const Demod = demodulator.Demodulator(1, &.{
+    .{ demodulator_base_freq * 1, demodulator_base_freq * 2 },
+    .{ demodulator_base_freq * 3, demodulator_base_freq * 4 },
+    .{ demodulator_base_freq * 5, demodulator_base_freq * 6 },
+    .{ demodulator_base_freq * 7, demodulator_base_freq * 8 },
+    .{ demodulator_base_freq * 9, demodulator_base_freq * 10 },
+    .{ demodulator_base_freq * 11, demodulator_base_freq * 12 },
+    .{ demodulator_base_freq * 13, demodulator_base_freq * 14 },
+    .{ demodulator_base_freq * 15, demodulator_base_freq * 16 },
+}, sample_rate, goertzel_N);
+var demod = Demod{};
+
+var demodulated_data_ring_buf: [1024]u8 = undefined;
+var demodulated_data_write_pos: u16 = 0;
+var demodulated_data_read_pos: u16 = 0;
 
 fn paCallback(
     in_buf: ?*const anyopaque,
@@ -111,26 +161,46 @@ fn paCallback(
     @memset(outs[1][0..frame_count], 0);
 
     for (0..frame_count) |i| {
-        goertzel_buffer[sample_counter] = ins[0][i];
-        sample_counter += 1;
-        if (sample_counter == goertzel_N) {
-            sample_counter = 0;
-            for (goertzel_detect_frequencies, &goertzel_powers, 0..) |freq, *pow, j| {
-                pow.* = goertzel(goertzel_buffer[0..], freq, goertzel_N);
-                if (j == 0) {
-                    goertzel_strongest_freq_index = 0;
-                } else {
-                    // NOTE: this can be calculated outside of audio callback,
-                    // but requires reading all powers atomically
-                    if (pow.* > goertzel_powers[j - 1]) {
-                        goertzel_strongest_freq_index = j;
-                    }
+        demodulate_stream(ins[0][i]);
+    }
+
+    return c.paContinue;
+}
+
+fn demodulate_stream(in_samp: f32) void {
+    goertzel_buffer[sample_counter] = in_samp;
+    sample_counter += 1;
+
+    if (sample_counter == goertzel_buffer.len) {
+        sample_counter = 0;
+
+        @fence(.AcqRel); // TODO
+        const symbol = demod.analyze(&goertzel_buffer);
+        demodulated_data_ring_buf[demodulated_data_write_pos] = @bitCast(symbol);
+
+        @fence(.AcqRel); // TODO
+        demodulated_data_write_pos = @intCast((demodulated_data_write_pos + 1) % demodulated_data_ring_buf.len);
+    }
+}
+
+fn goertzel_analyze_stream(in_samp: f32) void {
+    goertzel_buffer[sample_counter] = in_samp;
+    sample_counter += 1;
+    if (sample_counter == goertzel_buffer.len) {
+        sample_counter = 0;
+        for (goertzel_detect_frequencies, &goertzel_powers, 0..) |freq, *pow, j| {
+            pow.* = goertzel(goertzel_buffer[0..], freq, goertzel_N);
+            if (j == 0) {
+                goertzel_strongest_freq_index = 0;
+            } else {
+                // NOTE: this can be calculated outside of audio callback,
+                // but requires reading all powers atomically
+                if (pow.* > goertzel_powers[j - 1]) {
+                    goertzel_strongest_freq_index = j;
                 }
             }
         }
     }
-
-    return c.paContinue;
 }
 
 /// Calculates the power of the given frequency within the input sample slice.
