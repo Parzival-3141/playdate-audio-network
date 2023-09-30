@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) !void {
 }
 
 const playdate_target = blk: {
-    @setEvalBranchQuota(5000);
+    @setEvalBranchQuota(6000);
     break :blk std.zig.CrossTarget.parse(.{
         .arch_os_abi = "thumb-freestanding-eabihf",
         .cpu_features = "cortex_m7-fp64-fp_armv8d16-fpregs64-vfp2-vfp3d16-vfp4d16",
@@ -133,12 +133,17 @@ fn addPlaydateSimulatorRun(
     playdate_sdk_path: ?[]const u8,
 ) !void {
     const default_sdk_path = switch (os_tag) {
-        .windows => @panic("TODO: default Playdate SDK path on Windows"),
-        .linux => @panic("TODO: default Playdate SDK path on Linux"),
+        .windows => if (std.process.getEnvVarOwned(b.allocator, "USERPROFILE")) |home| path: {
+            defer b.allocator.free(home);
+            break :path std.fs.path.join(b.allocator, &.{ home, "Documents", "PlaydateSDK" }) catch @panic("OOM");
+        } else |err| std.debug.panic("could not get %USERPROFILE%: {s}\n", .{@errorName(err)}),
+
         .macos => if (std.os.getenv("HOME")) |home|
             std.fs.path.join(b.allocator, &.{ home, "Developer", "PlaydateSDK" }) catch @panic("OOM")
         else
             @panic("could not get $HOME"),
+
+        .linux => @panic("TODO: default Playdate SDK path on Linux"),
         else => @panic("TODO: unsupported OS"),
     };
     const sdk_path = playdate_sdk_path orelse default_sdk_path;
