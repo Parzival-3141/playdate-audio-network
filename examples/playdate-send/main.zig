@@ -1,5 +1,6 @@
 const std = @import("std");
-const pdapi = @import("playdate_api_definitions.zig");
+const pdapi = @import("playdate");
+const Modulator = @import("modem").modulator.Modulator;
 
 var g_playdate_image: *pdapi.LCDBitmap = undefined;
 var playdate: *pdapi.PlaydateAPI = undefined;
@@ -187,7 +188,7 @@ fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
 
 const modulator_N = 36;
 const modulator_base_freq = 44_100.0 / modulator_N;
-const Modulator = @import("modulator.zig").Modulator(1, &.{
+var modulator = Modulator(1, &.{
     .{ modulator_base_freq * 1, modulator_base_freq * 2 },
     .{ modulator_base_freq * 3, modulator_base_freq * 4 },
     .{ modulator_base_freq * 5, modulator_base_freq * 6 },
@@ -196,8 +197,7 @@ const Modulator = @import("modulator.zig").Modulator(1, &.{
     .{ modulator_base_freq * 11, modulator_base_freq * 12 },
     .{ modulator_base_freq * 13, modulator_base_freq * 14 },
     .{ modulator_base_freq * 15, modulator_base_freq * 16 },
-}, 44_100, 64);
-var modulator = Modulator.init();
+}, 44_100, 64).init();
 var modulator_sample_count: u16 = 0;
 const modulator_data: []const u8 =
     \\One morning, as Gregor Samsa was waking up from anxious dreams, he

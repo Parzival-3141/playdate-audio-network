@@ -1,0 +1,10 @@
+.{
+    .name = "pd-modem",
+    .version = "0.1.0",
+    .dependencies = .{
+        .portaudio = .{
+            .url = "https://github.com/hryx/portaudio/archive/f9dfb84aa8553729ba5778a92f7fad1cc55b8eb8.tar.gz",
+            .hash = "1220a2c9fa17b4f08cc8d280ddb2ba7423c18ce911b1aa4776fd471a78f07b5fdeb8",
+        },
+    },
+}

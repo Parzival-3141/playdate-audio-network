@@ -1,0 +1,5 @@
+name=Modem Demo
+author=Hryx & Parzival
+description=Modulate digital data over audio. What terrible songs the birds sing!
+bundleID=net.hryx.playdate.demo-kafka
+imagePath=.
