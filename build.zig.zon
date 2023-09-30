@@ -3,8 +3,8 @@
     .version = "0.1.0",
     .dependencies = .{
         .portaudio = .{
-            .url = "https://github.com/hryx/portaudio/archive/a37c79d16239d20eb90c27000d3c41e08575fd3b.tar.gz",
-            .hash = "1220bc84016e38a4a3244d91f1cdececb9afb533838825a3d4cc8b70883a725d3bd7",
+            .url = "https://github.com/hryx/portaudio/archive/f9dfb84aa8553729ba5778a92f7fad1cc55b8eb8.tar.gz",
+            .hash = "1220a2c9fa17b4f08cc8d280ddb2ba7423c18ce911b1aa4776fd471a78f07b5fdeb8",
         },
     },
 }
