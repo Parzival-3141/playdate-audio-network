@@ -17,16 +17,6 @@ pub fn build(b: *std.Build) !void {
     );
     const portaudio_lib = portaudio_dep.artifact("portaudio");
 
-    const example_dump_exe = b.addExecutable(.{
-        .name = "example-demodulator-dump",
-        .root_source_file = .{ .path = "examples/demodulator_dump.zig" },
-        .target = target,
-        .optimize = optimize,
-    });
-    example_dump_exe.addModule("modem", modem_mod);
-    example_dump_exe.linkLibrary(portaudio_lib);
-    b.installArtifact(example_dump_exe);
-
     const example_send_game = try addPlaydateGameExe(b, .{ .path = "examples/playdate-send/main.zig" }, .{
         .optimize = optimize,
         .assets_dir = "examples/playdate-send/assets",
@@ -37,14 +27,42 @@ pub fn build(b: *std.Build) !void {
     });
     try addPlaydateSimulatorRun(b, "example-playdate-send", example_send_game, sdk_path);
 
-    const example_dump_run_cmd = b.addRunArtifact(example_dump_exe);
-    example_dump_run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        example_dump_run_cmd.addArgs(args);
+    const pc_examples = .{
+        .{ .name = "demodulator-dump", .src = "demodulator_dump.zig", .pa = true },
+        .{ .name = "modulator-write-raw", .src = "modulator_write_raw.zig", .pa = false },
+        .{ .name = "visualize-goertzel", .src = "visualize_goertzel.zig", .pa = true },
+    };
+    inline for (pc_examples) |ex| {
+        const exe = b.addExecutable(.{
+            .name = ex.name,
+            .root_source_file = .{ .path = "examples/" ++ ex.src },
+            .target = target,
+            .optimize = optimize,
+        });
+        exe.addModule("modem", modem_mod);
+        if (ex.pa) exe.linkLibrary(portaudio_lib);
+        b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| {
+            run.addArgs(args);
+        }
+
+        const run_step = b.step("example-" ++ ex.name, "Run example " ++ ex.name);
+        run_step.dependOn(&run.step);
     }
 
-    const example_dump_run_step = b.step("example-demodulator-dump", "Run the demodulator dump example");
-    example_dump_run_step.dependOn(&example_dump_run_cmd.step);
+    const tests = b.addTest(.{
+        .root_source_file = .{ .path = "src/modem.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const tests_run_cmd = b.addRunArtifact(tests);
+
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&tests_run_cmd.step);
 }
 
 const playdate_target = blk: {
