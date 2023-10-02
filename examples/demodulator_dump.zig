@@ -4,7 +4,17 @@ const c = @cImport({
     @cInclude("portaudio.h");
 });
 
-const demodulator = @import("modem").demodulator;
+const options = @import("options");
+pub const std_options = struct {
+    pub const log_level = switch (options.log_level) {
+        .err => .err,
+        .warn => .warn,
+        .info => .info,
+        .debug => .debug,
+    };
+};
+
+const Demodulator = @import("modem").modem2.Demodulator;
 
 var stream: ?*c.PaStream = null;
 const sample_rate: f32 = 44_100;
@@ -30,7 +40,7 @@ pub fn main() !void {
         &stream,
         &in_params,
         null,
-        44_100,
+        sample_rate,
         c.paFramesPerBufferUnspecified,
         c.paNoFlag,
         paCallback,
@@ -68,28 +78,17 @@ fn dump_bitstream() void {
     }
 }
 
-const goertzel_N = 36;
-/// Duration in samples of a single symbol. Inversely proportional to baud.
-const goertzel_symbol_period = 36;
-var sample_counter: u32 = 0;
-var goertzel_buffer: [goertzel_symbol_period]f32 = undefined;
+const goertzel_N = 30;
+const resync_adjust = -35;
 
-const demodulator_base_freq = sample_rate / goertzel_N;
-const Demod = demodulator.Demodulator(1, &.{
-    .{ demodulator_base_freq * 1, demodulator_base_freq * 2 },
-    .{ demodulator_base_freq * 3, demodulator_base_freq * 4 },
-    .{ demodulator_base_freq * 5, demodulator_base_freq * 6 },
-    .{ demodulator_base_freq * 7, demodulator_base_freq * 8 },
-    .{ demodulator_base_freq * 9, demodulator_base_freq * 10 },
-    .{ demodulator_base_freq * 11, demodulator_base_freq * 12 },
-    .{ demodulator_base_freq * 13, demodulator_base_freq * 14 },
-    .{ demodulator_base_freq * 15, demodulator_base_freq * 16 },
-}, sample_rate, goertzel_N);
-var demod = Demod{};
+var demodulator = Demodulator(goertzel_N, sample_rate).init();
 
 var demodulated_data_ring_buf: [1024]u8 = undefined;
 var demodulated_data_write_pos: u16 = 0;
 var demodulated_data_read_pos: u16 = 0;
+
+var demodulate_signal_buf_arr: [goertzel_N]f32 = undefined;
+var demodulate_signal_buf: []f32 = demodulate_signal_buf_arr[0..0];
 
 fn paCallback(
     in_buf: ?*const anyopaque,
@@ -106,27 +105,56 @@ fn paCallback(
 
     const ins: [*]const [*]const f32 = if (in_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
 
-    for (0..frame_count) |i| {
-        demodulate_stream(ins[0][i]);
+    var i: u32 = 0;
+
+    // Left over from the previous callback
+    if (demodulate_signal_buf.len > 0) {
+        if (frame_count < goertzel_N) @panic("TODO: handle small callback windows");
+
+        while (i + goertzel_N < demodulate_signal_buf.len) : (i += goertzel_N) {
+            const res = demodulator.demodulate(demodulate_signal_buf[i .. i + goertzel_N]) catch no_sig: {
+                // Add delay to try and resync
+                const adjusted = @as(i64, @intCast(i)) + resync_adjust;
+                if (adjusted > 0 and adjusted < demodulate_signal_buf.len) {
+                    i = @intCast(adjusted);
+                }
+                break :no_sig null;
+            };
+            if (res) |char| produce_data(char);
+        }
+
+        demodulate_signal_buf = demodulate_signal_buf_arr[0..0];
+    }
+
+    // Incoming stream data
+    while (i + goertzel_N < frame_count) : (i += goertzel_N) {
+        const res = demodulator.demodulate(ins[0][i .. i + goertzel_N]) catch no_sig: {
+            // Add delay to try and resync
+            const adjusted = @as(i64, @intCast(i)) + resync_adjust;
+            if (adjusted > 0 and adjusted < frame_count) {
+                i = @intCast(adjusted);
+            }
+            break :no_sig null;
+        };
+        if (res) |char| produce_data(char);
+    }
+
+    // There are left over samples to buffer for next callback
+    if (i < frame_count) {
+        const rem = frame_count - i;
+        @memcpy(demodulate_signal_buf_arr[0..rem], ins[0][i..frame_count]);
+        demodulate_signal_buf = demodulate_signal_buf_arr[0..rem];
     }
 
     return c.paContinue;
 }
 
-fn demodulate_stream(in_samp: f32) void {
-    goertzel_buffer[sample_counter] = in_samp;
-    sample_counter += 1;
+fn produce_data(byte: u8) void {
+    @fence(.AcqRel); // TODO
+    demodulated_data_ring_buf[demodulated_data_write_pos] = byte;
 
-    if (sample_counter == goertzel_buffer.len) {
-        sample_counter = 0;
-
-        @fence(.AcqRel); // TODO
-        const symbol = demod.analyze(&goertzel_buffer);
-        demodulated_data_ring_buf[demodulated_data_write_pos] = @bitCast(symbol);
-
-        @fence(.AcqRel); // TODO
-        demodulated_data_write_pos = @intCast((demodulated_data_write_pos + 1) % demodulated_data_ring_buf.len);
-    }
+    @fence(.AcqRel); // TODO
+    demodulated_data_write_pos = @intCast((demodulated_data_write_pos + 1) % demodulated_data_ring_buf.len);
 }
 
 fn paAssert(code: c.PaError) void {

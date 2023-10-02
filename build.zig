@@ -27,6 +27,10 @@ pub fn build(b: *std.Build) !void {
     });
     try addPlaydateSimulatorRun(b, "example-playdate-send", example_send_game, sdk_path);
 
+    const log_level = b.option(std.log.Level, "log-level", "Log verbosity threshold") orelse .info;
+    const options = b.addOptions();
+    options.addOption(std.log.Level, "log_level", log_level);
+
     const pc_examples = .{
         .{ .name = "demodulator-dump", .src = "demodulator_dump.zig", .pa = true },
         .{ .name = "modulator-write-raw", .src = "modulator_write_raw.zig", .pa = false },
@@ -40,6 +44,7 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
         });
         exe.addModule("modem", modem_mod);
+        exe.addOptions("options", options);
         if (ex.pa) exe.linkLibrary(portaudio_lib);
         b.installArtifact(exe);
 

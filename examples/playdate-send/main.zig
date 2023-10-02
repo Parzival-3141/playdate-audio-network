@@ -1,6 +1,6 @@
 const std = @import("std");
 const pdapi = @import("playdate");
-const Modulator = @import("modem").modulator.Modulator;
+const Modulator = @import("modem").modem2.Modulator;
 
 var g_playdate_image: *pdapi.LCDBitmap = undefined;
 var playdate: *pdapi.PlaydateAPI = undefined;
@@ -186,18 +186,8 @@ fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     }
 }
 
-const modulator_N = 36;
-const modulator_base_freq = 44_100.0 / modulator_N;
-var modulator = Modulator(1, &.{
-    .{ modulator_base_freq * 1, modulator_base_freq * 2 },
-    .{ modulator_base_freq * 3, modulator_base_freq * 4 },
-    .{ modulator_base_freq * 5, modulator_base_freq * 6 },
-    .{ modulator_base_freq * 7, modulator_base_freq * 8 },
-    .{ modulator_base_freq * 9, modulator_base_freq * 10 },
-    .{ modulator_base_freq * 11, modulator_base_freq * 12 },
-    .{ modulator_base_freq * 13, modulator_base_freq * 14 },
-    .{ modulator_base_freq * 15, modulator_base_freq * 16 },
-}, 44_100, 64).init();
+const modulator_N = 30;
+var modulator = Modulator(modulator_N, 44_100, 64).init();
 var modulator_sample_count: u16 = 0;
 const modulator_data: []const u8 =
     \\One morning, as Gregor Samsa was waking up from anxious dreams, he
@@ -210,22 +200,29 @@ const modulator_data: []const u8 =
     \\
     \\
 ;
-var modulator_data_index: u16 = modulator_data.len;
+var modulator_data_index: u16 = 0;
+
+var next_symbol_signal_buf: [modulator_N]f32 = undefined;
+var next_symbol_ready = false;
+var next_symbol_index: u16 = 0;
 
 fn generate_modulated_data(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     for (left[0..count], right[0..count]) |*out, *dead| {
-        var mixed: f32 = 0;
-        const vals = modulator.generate_sample();
-        for (vals) |v| mixed += v;
-        out.* = convert_sample(mixed * 0.125);
-
         dead.* = 0;
 
-        modulator_sample_count += 1;
-        if (modulator_sample_count >= sequence_periods[sequence_periods_index]) {
+        if (!next_symbol_ready) {
+            const char = modulator_data[modulator_data_index];
             modulator_data_index = @intCast((modulator_data_index + 1) % modulator_data.len);
-            modulator.symbol = @bitCast(modulator_data[modulator_data_index]);
-            modulator_sample_count = 0;
+
+            modulator.modulate(char, &next_symbol_signal_buf);
+            next_symbol_ready = true;
+            next_symbol_index = 0;
+        }
+
+        out.* = convert_sample(next_symbol_signal_buf[next_symbol_index]);
+        next_symbol_index += 1;
+        if (next_symbol_index == next_symbol_signal_buf.len) {
+            next_symbol_ready = false;
         }
     }
 }

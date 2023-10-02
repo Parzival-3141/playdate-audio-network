@@ -84,24 +84,8 @@ pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime sine_table
                     }
 
                     for (buf[0..N], 0..N) |*out, i| {
-                        _ = i;
                         var samp = mod.payload_oscs[bit].generate(&sine_table, freqs.payload[bit]);
-
-                        // // Apply triangular window to output signal so that sudden oscillator
-                        // // starts and stops do not produce sidebands in the DAC and ADC.
-                        // //
-                        // // TODO: Explore other windowing functions that preserve more energy
-                        // // of the desired frequency. Maybe Welch window?
-
-                        // const i2_float: f32 = @floatFromInt(i * 2);
-                        // const N_float: f32 = @floatFromInt(N);
-                        // const frac = i2_float / (N_float); // Progress through the window, [0, 2]
-                        // if (frac <= 1) {
-                        //     samp *= frac;
-                        // } else {
-                        //     samp *= (2 - frac);
-                        // }
-
+                        samp = welch_window(samp, @as(f32, @floatFromInt(i)), N);
                         out.* += samp * 0.5;
                     }
                 }
@@ -112,9 +96,18 @@ pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime sine_table
     };
 }
 
+pub fn welch_window(y: f32, n: f32, N: f32) f32 {
+    var w = n - (N / 2);
+    w /= (N / 2);
+    w *= w;
+    w = 1 - w;
+    return y * w;
+}
+
 /// Creates a sinusoidal lookup table of the given length.
 /// Holds amplitudes in range [-1, 1] for one cycle of a sine.
 /// A length of 64 is fine for many practical purposes.
+/// Lookup table is scaled ahead of time to compensate for expected amplitude summation at runtime.
 pub fn create_sine_table(comptime len: u32, scale: f32) [len]f32 {
     if (len == 0) {
         @compileError("sine lookup table length must be > 0");
@@ -160,18 +153,49 @@ pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
             };
         }
 
+        /// Get the ratio of the higher value to the lower value.
+        /// Bounds are set to prevent NaN and Inf.
+        /// Also returns the higher of the two values.
+        fn magnitude_ratio(a: f32, b: f32) struct { f32, u1 } {
+            std.debug.assert(a >= 0);
+            std.debug.assert(b >= 0);
+
+            var lower = a;
+            var higher = b;
+            var sel: u1 = 1;
+            if (lower > higher) {
+                lower = b;
+                higher = a;
+                sel = 0;
+            }
+
+            lower = std.math.clamp(lower, 0.00001, 100.0);
+            higher = std.math.clamp(higher, 0.00001, 100.0);
+
+            return .{ higher / lower, sel };
+        }
+
         pub fn demodulate(demod: *Demod, signal: []const f32) Error!?u8 {
+            std.log.debug("----", .{});
+
+            var high_mag: f32 = undefined;
             {
                 const clk0 = goertzel(N, signal, freqs.clock[0]);
                 const clk1 = goertzel(N, signal, freqs.clock[1]);
-                const high = clk1 > clk0;
-                const diff = if (high) clk1 - clk0 else clk0 - clk1;
-                // TODO: if diff is below threshold, re-sync. if diff still low, error.NoSignal
-                // TODO: what is a reasonable diff?
-                if (diff < 0.5) {
+                // TODO: upgrade zig and destructure
+                const cmp = magnitude_ratio(clk0, clk1);
+                const ratio = cmp[0];
+                const higher = cmp[1];
+
+                std.log.debug("clk: {d} | {d} | {d}", .{ clk0, clk1, ratio });
+
+                // TODO: resync here
+                if (ratio < 100) {
                     demod.state = .start;
                     return error.NoSignal;
                 }
+                const high = higher == 1;
+                high_mag = ([2]f32{ clk0, clk1 })[higher];
 
                 // demod.last_clock = high;
 
@@ -202,14 +226,19 @@ pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
             const data = blk: {
                 const data0 = goertzel(N, signal, freqs.data[0]);
                 const data1 = goertzel(N, signal, freqs.data[1]);
-                const high = data1 > data0;
-                const diff = if (high) data1 - data0 else data0 - data1;
+                // TODO: upgrade zig and destructure
+                const cmp = magnitude_ratio(data0, data1);
+                const ratio = cmp[0];
+                const higher = cmp[1];
 
-                // TODO: what is a reasonable diff?
-                if (diff < 0.5) {
+                std.log.debug("data: {d} | {d} | {d}", .{ data0, data1, ratio });
+
+                // TODO: resync here
+                if (ratio < 100) {
                     demod.state = .start;
                     return error.NoSignal;
                 }
+                const high = higher == 1;
 
                 break :blk high;
             };
@@ -221,7 +250,9 @@ pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
             var byte: u8 = 0;
             for (freqs.payload, 0..) |freq, i| {
                 const mag = goertzel(N, signal, freq);
-                const val: u8 = @intFromBool(mag > 0.5); // TODO
+                const target_mag = high_mag / 20;
+                std.log.debug("freq {d} | mag {d} | target {d}", .{ i, mag, target_mag });
+                const val: u8 = @intFromBool(mag > target_mag); // TODO
                 const mask: u8 = val << @intCast(i);
                 byte |= mask;
             }
@@ -312,6 +343,7 @@ test "modulate and demodulate symbols" {
         const sym = try demod.demodulate(signal[N * i ..]);
 
         // TODO: Use testing log instead of panicking to see which iteration failed.
+        // https://github.com/ziglang/zig/issues/5738
         std.testing.expectEqual(p == null, sym == null) catch {
             std.debug.panic("payload null mismatch on iter {}", .{i});
         };
