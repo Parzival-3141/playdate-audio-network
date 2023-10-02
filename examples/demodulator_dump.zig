@@ -23,9 +23,10 @@ pub fn main() !void {
     paAssert(c.Pa_Initialize());
     defer paAssert(c.Pa_Terminate());
 
-    const in_device = c.Pa_GetDefaultInputDevice();
+    // const in_device = c.Pa_GetDefaultInputDevice();
+    const in_device = try get_input_device();
     if (in_device == c.paNoDevice) {
-        @panic("No default input device!\n");
+        @panic("invalid input device!\n");
     }
     const in_info = c.Pa_GetDeviceInfo(in_device);
     const in_params = c.PaStreamParameters{
@@ -50,6 +51,49 @@ pub fn main() !void {
     paAssert(c.Pa_StartStream(stream));
 
     dump_bitstream();
+}
+
+fn get_input_device() !c.PaDeviceIndex {
+    const num_devices: usize = num: {
+        const count = c.Pa_GetDeviceCount();
+        paAssert(@min(count, 0)); // portaudio errors are negative values, so we just check for that
+        break :num @intCast(count);
+    };
+    if (num_devices == 0) return error.NoAudioDevices;
+
+    const default = d: {
+        const dev = c.Pa_GetDefaultInputDevice();
+        break :d if (dev != c.paNoDevice) dev else null;
+    };
+
+    const stdout = std.io.getStdOut().writer();
+
+    try stdout.writeAll("\nChoose an input device to listen on (will use default if none is selected):\n");
+
+    if (default) |d| {
+        const info: *const c.PaDeviceInfo = c.Pa_GetDeviceInfo(d);
+        try stdout.print("  default: {s}\n", .{info.name});
+    }
+
+    var i: usize = 1;
+    for (0..num_devices) |d| {
+        const info: *const c.PaDeviceInfo = c.Pa_GetDeviceInfo(@intCast(d));
+        try stdout.print("  {d}: {s}\n", .{ i, info.name });
+        i += 1;
+    }
+
+    var buf: [10]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try std.io.getStdIn().reader().streamUntilDelimiter(fbs.writer(), '\n', null);
+    const input = std.mem.trim(u8, fbs.getWritten(), &std.ascii.whitespace);
+
+    if (input.len > 0) {
+        return try std.fmt.parseInt(c.PaDeviceIndex, input, 10) -| 1;
+    } else if (default) |d| {
+        return d;
+    } else {
+        return error.NoInputDevice;
+    }
 }
 
 fn dump_bitstream() void {
