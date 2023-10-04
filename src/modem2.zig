@@ -4,6 +4,9 @@ pub const SymbolFrequencies = extern struct {
     clock: [2]f32,
     data: [2]f32,
     payload: [8]f32,
+    // payload: [8][2]f32,
+
+    const freq_count = 12;
 
     /// Returns a set of frequencies that are optimal for Goertzel detection
     /// with N DFT terms at the given sample rate.
@@ -14,18 +17,20 @@ pub const SymbolFrequencies = extern struct {
     /// - Two for the clock bit oscillator, alternating low/high (FSK)
     /// - Two for the data bit oscillator, no/yes (FSK)
     /// - Eight for each payload bit oscillator, in least to most signifcant order (ASK)
-    pub fn init(N: u16, sample_rate: f32) SymbolFrequencies {
+    ///
+    /// first_bin determines the lowest frequency oscillator and should be between 1 and (N/2).
+    pub fn init(N: u16, sample_rate: f32, first_bin: u16) SymbolFrequencies {
         const base_freq = sample_rate / @as(f32, @floatFromInt(N));
-        if (base_freq < 20) {
+        if (base_freq < freq_count) {
             @compileError("modem signal contains a frequency below 20 Hz; choose a smaller value for N");
         }
-        if (base_freq * 12 > 20_000) {
+        if (base_freq * freq_count > 20_000) {
             @compileError("modem signal contains a frequency over 20 kHz; choose a larger value for N");
         }
 
-        var freqs: [12]f32 = undefined;
+        var freqs: [freq_count]f32 = undefined;
         for (&freqs, 0..) |*f, i| {
-            f.* = (base_freq * (i + 1)) / sample_rate;
+            f.* = (base_freq * (i + first_bin)) / sample_rate;
         }
 
         return @bitCast(freqs);
@@ -34,15 +39,23 @@ pub const SymbolFrequencies = extern struct {
 
 /// Creates a type that modulates data as an audio signal.
 /// The signal uses a combination of frequency-shift keying (FSK) and amplitude-shifk keying (ASK).
+/// N is the number of DFT terms, which determines the oscillator frequencies used.
 /// Sine waves are generated using a lookup table of the given length.
 /// 64 is a reasonable table length.
-pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime sine_table_len: u32) type {
-    const freqs = SymbolFrequencies.init(N, sample_rate);
+pub fn Modulator(
+    comptime N: u16,
+    comptime sample_rate: f32,
+    baud: f32,
+    comptime sine_table_len: u32,
+) type {
+    const freqs = SymbolFrequencies.init(N, sample_rate, 2);
 
     return struct {
         const Mod = @This();
 
+        pub const window_len: u32 = @intFromFloat(sample_rate / baud);
         pub const sine_table = create_sine_table(sine_table_len, 0.25);
+        // pub const sine_table = create_sine_table(sine_table_len, 0.1);
 
         clock: bool,
         clock_osc: Oscillator,
@@ -60,22 +73,30 @@ pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime sine_table
 
         /// Generate signal for the value (or no-op) into buf.
         /// Buf must be large enough to store one symbol period.
+        /// TODO: value: union(enum) { disconnected, nop, payload: u8 }
         pub fn modulate(mod: *Mod, value: ?u8, buf: []f32) void {
             // TODO: Check performance of summing one sample at a time vs.
             // adding all clock bit samples, then data bit samples, then payload samples.
             // The latter is probably more optimized.
 
-            for (buf[0..N]) |*out| {
+            // Generate clock sine
+            // TODO: gaussian filter freq-shift
+            for (buf[0..window_len]) |*out| {
                 // Clear buf on the first pass rather than summing existing signal,
                 // which is expected to be undefined.
                 out.* = mod.clock_osc.generate(&sine_table, freqs.clock[@intFromBool(mod.clock)]);
+                // out.* = 0;
             }
 
+            // Generate data sine
+            // TODO: gaussian filter freq-shift
             const data_bit = value != null;
-            for (buf[0..N]) |*out| {
+            for (buf[0..window_len]) |*out| {
                 out.* += mod.data_osc.generate(&sine_table, freqs.data[@intFromBool(data_bit)]);
             }
 
+            // Generate payload sines if there is a byte to send
+            // TODO: try other amplitude windows
             if (value) |byte| {
                 for (0..8) |bit| {
                     const mask: u8 = @as(u8, 1) << @intCast(bit);
@@ -83,13 +104,27 @@ pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime sine_table
                         continue;
                     }
 
-                    for (buf[0..N], 0..N) |*out, i| {
+                    for (buf[0..window_len], 0..window_len) |*out, i| {
                         var samp = mod.payload_oscs[bit].generate(&sine_table, freqs.payload[bit]);
                         samp = welch_window(samp, @as(f32, @floatFromInt(i)), N);
+                        // out.* += samp * 1.5;
                         out.* += samp * 0.5;
                     }
                 }
             }
+            // const byte = value orelse 0;
+            // for (0..8) |bit| {
+            //     const mask: u8 = @as(u8, 1) << @intCast(bit);
+            //     const active = @intFromBool(byte & mask != 0);
+            //     const freq = freqs.payload[bit][active];
+            //     // if (byte & mask == 0) {
+            //     //     continue;
+            //     // }
+
+            //     for (buf[0..N], 0..N) |*out, i| {
+            //         _ = i;
+            //         out.* += mod.payload_oscs[bit].generate(&sine_table, freq);
+            //     }
 
             mod.clock = !mod.clock;
         }
@@ -125,11 +160,12 @@ pub fn create_sine_table(comptime len: u32, scale: f32) [len]f32 {
     return vals;
 }
 
-pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
+pub fn Demodulator(comptime N: u16, comptime sample_rate: f32, baud: f32) type {
     const freqs = SymbolFrequencies.init(N, sample_rate);
 
     return struct {
         pub const Demod = @This();
+        pub const window_len: u32 = @intFromFloat(sample_rate / baud);
 
         pub const Error = error{NoSignal};
 
@@ -141,6 +177,9 @@ pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
 
         // last_clock: bool,
         state: State,
+        resync_countdown: u16,
+        buf: [window_len + (2 * N)]f32,
+        buf_len: u32,
         // buf: [N]f32,
         // buf_index: u16,
 
@@ -148,6 +187,9 @@ pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
             return .{
                 // .last_clock = false,
                 .state = .start,
+                .resync_countdown = 0,
+                .buf = undefined,
+                .buf_len = 0,
                 // .buf = &[0]f32{},
                 // .buf_index = 0,
             };
@@ -175,21 +217,54 @@ pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
             return .{ higher / lower, sel };
         }
 
-        pub fn demodulate(demod: *Demod, signal: []const f32) Error!?u8 {
+        pub const Result = union(enum) {
+            no_signal,
+            not_ready,
+            ready,
+            payload: u8,
+        };
+
+        pub fn demodulate(demod: *Demod, signal: []const f32) ?Result {
             std.log.debug("----", .{});
+
+            var s = signal;
 
             var high_mag: f32 = undefined;
             {
-                const clk0 = goertzel(N, signal, freqs.clock[0]);
-                const clk1 = goertzel(N, signal, freqs.clock[1]);
-                // TODO: upgrade zig and destructure
-                const cmp = magnitude_ratio(clk0, clk1);
-                const ratio = cmp[0];
-                const higher = cmp[1];
+                if (demod.resync_countdown == 0) {
+                    if (s.len < demod.buf.len) {
+                        @memcpy(demod.buf[0..s.len], s);
+                        demod.buf_len = @intCast(signal.len);
+                        return null;
+                    }
 
-                std.log.debug("clk: {d} | {d} | {d}", .{ clk0, clk1, ratio });
+                    // TODO: use buf from last time if there are any samples in it
+
+                    demod.resync_countdown = 10;
+
+                    var highest_ratio: f32 = 0;
+
+                    for (0..4) |_| {
+                        const clk0 = goertzel(N, s, freqs.clock[0]);
+                        const clk1 = goertzel(N, s, freqs.clock[1]);
+                        // TODO: upgrade zig and destructure
+                        const cmp = magnitude_ratio(clk0, clk1);
+                        const ratio = cmp[0];
+                        const higher = cmp[1];
+                        _ = higher;
+                        if (ratio > highest_ratio) {
+                            highest_ratio = ratio;
+                        } else {
+                            //
+                        }
+                    }
+                    //
+                }
+
+                std.log.debug("clk:  {d: >11.4} | {d: >11.4} | {d: >11.4}", .{ clk0, clk1, ratio });
 
                 // TODO: resync here
+                // if (ratio < 10) {
                 if (ratio < 100) {
                     demod.state = .start;
                     return error.NoSignal;
@@ -231,9 +306,10 @@ pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
                 const ratio = cmp[0];
                 const higher = cmp[1];
 
-                std.log.debug("data: {d} | {d} | {d}", .{ data0, data1, ratio });
+                std.log.debug("data: {d: >11.4} | {d: >11.4} | {d: >11.4}", .{ data0, data1, ratio });
 
                 // TODO: resync here
+                // if (ratio < 10) {
                 if (ratio < 100) {
                     demod.state = .start;
                     return error.NoSignal;
@@ -250,12 +326,33 @@ pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
             var byte: u8 = 0;
             for (freqs.payload, 0..) |freq, i| {
                 const mag = goertzel(N, signal, freq);
-                const target_mag = high_mag / 20;
+                // const target_mag = high_mag / 30;
+                const target_mag = 1.5;
                 std.log.debug("freq {d} | mag {d} | target {d}", .{ i, mag, target_mag });
                 const val: u8 = @intFromBool(mag > target_mag); // TODO
                 const mask: u8 = val << @intCast(i);
                 byte |= mask;
             }
+
+            // for (0..8) |bit| {
+            //     // const target_mag = high_mag / 20;
+            //     // std.log.debug("freq {d} | mag {d} | target {d}", .{ i, mag, target_mag });
+            //     // const val: u8 = @intFromBool(mag > target_mag); // TODO
+
+            //     const mag0 = goertzel(N, signal, freqs.payload[bit][0]);
+            //     const mag1 = goertzel(N, signal, freqs.payload[bit][1]);
+            //     const cmp = magnitude_ratio(mag0, mag1);
+            //     const ratio = cmp[0];
+            //     const higher = cmp[1];
+
+            //     // const val: u8 = @intFromBool(mag1 > mag0);
+            //     const val: u8 = higher;
+
+            //     std.log.debug("bit{}: {d: >11.4} | {d: >11.4} | {d: >11.4} | {}", .{ bit, mag0, mag1, ratio, val });
+
+            //     const mask: u8 = val << @intCast(bit);
+            //     byte |= mask;
+            // }
 
             return byte;
         }

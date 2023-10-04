@@ -186,7 +186,7 @@ fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     }
 }
 
-const modulator_N = 30;
+const modulator_N = 96;
 var modulator = Modulator(modulator_N, 44_100, 64).init();
 var modulator_sample_count: u16 = 0;
 const modulator_data: []const u8 =
@@ -200,6 +200,7 @@ const modulator_data: []const u8 =
     \\
     \\
 ;
+// const modulator_data: []const u8 = "aaaaaaaa\n\n77777777\n\n........\n\n########\n\n";
 var modulator_data_index: u16 = 0;
 
 var next_symbol_signal_buf: [modulator_N]f32 = undefined;

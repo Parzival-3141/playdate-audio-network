@@ -32,7 +32,7 @@ pub fn main() !void {
         .device = in_device,
         .channelCount = @intCast(1),
         .sampleFormat = c.paFloat32 | c.paNonInterleaved,
-        .suggestedLatency = in_info.*.defaultLowInputLatency,
+        .suggestedLatency = in_info.*.defaultHighInputLatency,
         .hostApiSpecificStreamInfo = null,
     };
 
@@ -78,17 +78,15 @@ fn dump_bitstream() void {
     }
 }
 
-const goertzel_N = 30;
-const resync_adjust = -35;
+const goertzel_N = 96;
+const resync_adjust = 0;
 
-var demodulator = Demodulator(goertzel_N, sample_rate).init();
+const Demod = Demodulator(goertzel_N, sample_rate);
+var demodulator = Demod.init();
 
 var demodulated_data_ring_buf: [1024]u8 = undefined;
 var demodulated_data_write_pos: u16 = 0;
 var demodulated_data_read_pos: u16 = 0;
-
-var demodulate_signal_buf_arr: [goertzel_N]f32 = undefined;
-var demodulate_signal_buf: []f32 = demodulate_signal_buf_arr[0..0];
 
 fn paCallback(
     in_buf: ?*const anyopaque,
@@ -98,6 +96,7 @@ fn paCallback(
     status_flags: c.PaStreamCallbackFlags,
     user_data: ?*anyopaque,
 ) callconv(.C) c_int {
+    _ = frame_count;
     _ = out_buf;
     _ = user_data;
     _ = status_flags;
@@ -106,45 +105,14 @@ fn paCallback(
     const ins: [*]const [*]const f32 = if (in_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
 
     var i: u32 = 0;
+    _ = i;
 
-    // Left over from the previous callback
-    if (demodulate_signal_buf.len > 0) {
-        if (frame_count < goertzel_N) @panic("TODO: handle small callback windows");
-
-        while (i + goertzel_N < demodulate_signal_buf.len) : (i += goertzel_N) {
-            const res = demodulator.demodulate(demodulate_signal_buf[i .. i + goertzel_N]) catch no_sig: {
-                // Add delay to try and resync
-                const adjusted = @as(i64, @intCast(i)) + resync_adjust;
-                if (adjusted > 0 and adjusted < demodulate_signal_buf.len) {
-                    i = @intCast(adjusted);
-                }
-                break :no_sig null;
-            };
-            if (res) |char| produce_data(char);
-        }
-
-        demodulate_signal_buf = demodulate_signal_buf_arr[0..0];
-    }
-
-    // Incoming stream data
-    while (i + goertzel_N < frame_count) : (i += goertzel_N) {
-        const res = demodulator.demodulate(ins[0][i .. i + goertzel_N]) catch no_sig: {
-            // Add delay to try and resync
-            const adjusted = @as(i64, @intCast(i)) + resync_adjust;
-            if (adjusted > 0 and adjusted < frame_count) {
-                i = @intCast(adjusted);
-            }
-            break :no_sig null;
-        };
-        if (res) |char| produce_data(char);
-    }
-
-    // There are left over samples to buffer for next callback
-    if (i < frame_count) {
-        const rem = frame_count - i;
-        @memcpy(demodulate_signal_buf_arr[0..rem], ins[0][i..frame_count]);
-        demodulate_signal_buf = demodulate_signal_buf_arr[0..rem];
-    }
+    var offset: u32 = 0;
+    while (demodulator.demodulate(ins[0][offset..])) |res| : (offset += Demod.window_len) switch (res) {
+        .no_signal => produce_data('*'),
+        .not_ready, .ready => {},
+        .payload => |byte| produce_data(byte),
+    };
 
     return c.paContinue;
 }
