@@ -1,34 +1,34 @@
 const std = @import("std");
 
-pub const SymbolFrequencies = extern struct {
+pub const OscillatorRates = extern struct {
     clock: [2]f32,
-    data: [2]f32,
+    header: [3]f32,
     payload: [8]f32,
 
-    /// Returns a set of frequencies that are optimal for Goertzel detection
-    /// with N DFT terms at the given sample rate.
-    /// Each frequency is normalized as a fraction of sample rate, which is also the
-    /// oscillator's per-rample phase increment.
+    const osc_count = 13;
+
+    /// Returns a set of oscillator phase rates (inverse frequencies) that are optimal for
+    /// Goertzel detection with N DFT terms at the given sample rate.
     ///
     /// One symbol requires 12 unique frequencies, in increasing order:
-    /// - Two for the clock bit oscillator, alternating low/high (FSK)
-    /// - Two for the data bit oscillator, no/yes (FSK)
+    /// - Two for the clock oscillator, alternating low/high (FSK)
+    /// - Three for the header oscillator, disconnected/connected/payload (FSK)
     /// - Eight for each payload bit oscillator, in least to most signifcant order (ASK)
-    pub fn init(N: u16, sample_rate: f32) SymbolFrequencies {
+    pub fn init(N: u16, sample_rate: f32) OscillatorRates {
         const base_freq = sample_rate / @as(f32, @floatFromInt(N));
         if (base_freq < 20) {
             @compileError("modem signal contains a frequency below 20 Hz; choose a smaller value for N");
         }
-        if (base_freq * 12 > 20_000) {
+        if (base_freq * osc_count > 20_000) {
             @compileError("modem signal contains a frequency over 20 kHz; choose a larger value for N");
         }
 
-        var freqs: [12]f32 = undefined;
-        for (&freqs, 0..) |*f, i| {
+        var rates: [osc_count]f32 = undefined;
+        for (&rates, 0..) |*f, i| {
             f.* = (base_freq * (i + 1)) / sample_rate;
         }
 
-        return @bitCast(freqs);
+        return @bitCast(rates);
     }
 };
 
