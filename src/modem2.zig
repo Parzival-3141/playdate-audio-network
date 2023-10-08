@@ -36,22 +36,30 @@ pub const OscillatorRates = extern struct {
 /// The signal uses a combination of frequency-shift keying (FSK) and amplitude-shifk keying (ASK).
 /// Sine waves are generated using a lookup table of the given length.
 /// 64 is a reasonable table length.
-pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime baud: f32, comptime sine_table_len: u32) type {
-    const window_len_float = sample_rate / baud;
-    const window_len: u16 = @intFromFloat(window_len_float);
-    if (window_len_float != @as(f32, @floatFromInt(window_len))) {
-        @compileError("baud must be integer divisible by sample rate");
-    }
-
+pub fn Modulator(
+    comptime N: u16,
+    comptime sample_rate: comptime_float,
+    comptime baud: comptime_float,
+    comptime sine_table_len: u32,
+) type {
     const rates = OscillatorRates.init(N, sample_rate);
 
     return struct {
         const Mod = @This();
 
-        pub const sine_scaling = 0.25;
+        const N_float: comptime_float = @floatFromInt(N);
+        const window_len_float = sample_rate / baud;
+        pub const window_len: u16 = @intFromFloat(window_len_float);
+        comptime {
+            if (window_len_float != @as(comptime_float, @floatFromInt(window_len))) {
+                @compileError("baud must be integer divisible by sample rate");
+            }
+        }
+
+        pub const sine_scaling = 0.2;
         pub const sine_table = create_sine_table(sine_table_len);
 
-        pub const State = union(enum) {
+        pub const Symbol = union(enum) {
             disconnected,
             connected,
             payload: u8,
@@ -61,8 +69,8 @@ pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime baud: f32,
         clock_osc_fm: Oscillator,
         header_osc: Oscillator,
         payload_oscs: [8]Oscillator,
-        last_header_freq: u2,
-        last_payload_byte: u8,
+        last_header: u2,
+        last_payload: u8,
 
         pub fn init() Mod {
             return Mod{
@@ -70,23 +78,24 @@ pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime baud: f32,
                 .clock_osc_fm = .{
                     // Initial phase is offset such that the clock freqs are strongest
                     // at the center of the the significant N samples of the window.
-                    .phase = 1 - (@as(f32, @floatFromInt(N)) / 2.0) / window_len_float,
+                    .phase = 1.0 - (N_float / 2.0) / window_len_float,
                 },
                 .header_osc = .{},
                 .payload_oscs = .{.{}} ** 8,
-                .last_header_freq = 0,
-                .last_payload_byte = 0,
+                .last_header = 0,
+                .last_payload = 0,
             };
         }
 
         /// Generate signal for the value (or no-op) into buf.
         /// Buf must be large enough to store one symbol period.
-        pub fn modulate(mod: *Mod, state: State, buf: []f32) void {
+        pub fn modulate(mod: *Mod, symbol: Symbol, buf: []f32) void {
             for (buf[0..window_len]) |*out| {
                 // Get clock FM value, which oscillates between the two clock frequencies.
+                // TODO: This should be precalclated in OscillatorRates.
                 const diff = rates.clock[1] - rates.clock[0];
                 const center = rates.clock[0] + (diff / 2);
-                var carrier_rate = mod.clock_osc_fm.generate(&sine_table, baud / sample_rate); // [-1, 1]
+                var carrier_rate = mod.clock_osc_fm.generate(&sine_table, baud / sample_rate / 2.0); // [-1, 1]
                 carrier_rate *= diff; // [-diff, diff]
                 carrier_rate += center; // [center-diff, center+diff] = [low, high]
 
@@ -99,26 +108,38 @@ pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime baud: f32,
             // This transition helps avoid creating bursts of energy in higher frequencies (noise).
             const transition_samples = window_len - N;
 
-            const header_freq = @intFromEnum(state);
-            if (header_freq != mod.last_header_freq) {
-                // Transition from old frequency to new
-                const going_up = header_freq > mod.last_header_freq;
-                for (buf[0..transition_samples], 0..) |*out, i| {
-                    const frac = @as(f32, @floatFromInt(i)) / transition_samples;
-                    const amp = cosine_transition_value(&sine_table, frac, going_up);
-                    var samp = mod.payload_oscs[header_freq].generate(&sine_table, rates.payload[header_freq]);
-                    out.* += samp * amp * (sine_scaling / 2.0);
+            {
+                var start: u32 = 0;
+                var len: u32 = window_len;
+
+                const header = @intFromEnum(symbol);
+                if (header != mod.last_header) {
+                    // Transition from old frequency to new
+                    for (buf[0..transition_samples], 0..) |*out, i| {
+                        const frac = @as(f32, @floatFromInt(i)) / transition_samples;
+                        const freq = cosine_interpolate(
+                            &sine_table,
+                            rates.header[mod.last_header],
+                            rates.header[header],
+                            frac,
+                        );
+                        var samp = mod.header_osc.generate(&sine_table, freq);
+                        out.* += samp * sine_scaling;
+                    }
+
+                    start = transition_samples;
+                    len = N;
                 }
-            }
-            // Hold frequency for remaining samples
-            for (buf[transition_samples..][0..N]) |*out| {
-                var samp = mod.payload_oscs[header_freq].generate(&sine_table, rates.payload[header_freq]);
-                out.* += samp * (sine_scaling / 2.0);
+                // Hold frequency for remaining samples
+                for (buf[start..][0..len]) |*out| {
+                    var samp = mod.header_osc.generate(&sine_table, rates.header[header]);
+                    out.* += samp * sine_scaling;
+                }
+
+                mod.last_header = header;
             }
 
-            mod.last_header_freq = header_freq;
-
-            const byte = switch (state) {
+            const byte = switch (symbol) {
                 .payload => |b| b,
                 else => 0,
             };
@@ -126,33 +147,45 @@ pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime baud: f32,
             for (0..8) |bit| {
                 const mask: u8 = @as(u8, 1) << @intCast(bit);
                 const bit_set = byte & mask != 0;
-                const last_bit_set = mod.last_payload_byte & mask != 0;
+                const last_bit_set = mod.last_payload & mask != 0;
 
                 // No output if holding a zero amplitude
                 if (!bit_set and !last_bit_set) {
                     continue;
                 }
 
+                var start: u32 = 0;
+                var len: u32 = window_len;
+
                 if (bit_set != last_bit_set) {
                     // Transition from old amplitude to new
-                    const going_up = bit_set;
                     for (buf[0..transition_samples], 0..) |*out, i| {
                         const frac = @as(f32, @floatFromInt(i)) / transition_samples;
-                        const amp = cosine_transition_value(&sine_table, frac, going_up);
+                        const amp = cosine_interpolate(
+                            &sine_table,
+                            @floatFromInt(@intFromBool(last_bit_set)),
+                            @floatFromInt(@intFromBool(bit_set)),
+                            frac,
+                        );
                         var samp = mod.payload_oscs[bit].generate(&sine_table, rates.payload[bit]);
                         out.* += samp * amp * (sine_scaling / 2.0);
                     }
+
+                    start = transition_samples;
+                    len = N;
                 }
 
                 // Hold amplitude for remaining samples
                 if (!bit_set) {
                     continue;
                 }
-                for (buf[transition_samples..][0..N]) |*out| {
+                for (buf[start..][0..len]) |*out| {
                     var samp = mod.payload_oscs[bit].generate(&sine_table, rates.payload[bit]);
                     out.* += samp * (sine_scaling / 2.0);
                 }
             }
+
+            mod.last_payload = byte;
         }
     };
 }
@@ -180,26 +213,54 @@ pub fn create_sine_table(comptime len: u32) [len]f32 {
 
     var vals: [len]f32 = undefined;
     for (&vals, 0..) |*v, i| {
-        v.* = @floatCast(@sin(i / @as(f64, vals.len) * std.math.pi * 2));
+        var frac: f64 = @floatFromInt(i);
+        frac /= vals.len;
+        v.* = @floatCast(@sin(frac * std.math.pi * 2));
     }
 
     return vals;
 }
 
-/// Return a value ramping from 0 to 1 for the given phase, shaped by a half cosine curve.
-/// If up is false, value instead ramps down from 1 to 0 as phase increases.
-pub fn cosine_transition_value(comptime sine_table: []const f32, phase: f32, up: bool) f32 {
+/// Returns sin(phase * 2pi) using the lookup table with linear interpolation.
+/// Phase must be in range [0, 1).
+pub fn sine_value(sine_table: []const f32, phase: f32) f32 {
     std.debug.assert(phase >= 0 and phase < 1);
-    var p = phase / 2;
+
+    const index_float = phase * @as(f32, @floatFromInt(sine_table.len));
+    const index: u32 = @intFromFloat(index_float);
+    const frac = index_float - @as(f32, @floatFromInt(index));
+
+    const y1 = sine_table[index % sine_table.len];
+    const y2 = sine_table[(index + 1) % sine_table.len];
+
+    return std.math.lerp(y1, y2, frac);
+}
+
+/// Return a value that is a fraction of the way between `from` and `to`, where the transition is
+/// curved by a half cosine rather than linear. Asserts frac is in range [0, 1).
+pub fn cosine_interpolate(sine_table: []const f32, from: f32, to: f32, frac: f32) f32 {
+    std.debug.assert(frac >= 0 and frac < 1);
+
+    var p = frac / 2;
     p += 0.25;
-    const index: u32 = @intFromFloat(p * sine_table.len);
-    var y = sine_table[index]; // [1, -1]
+
+    var y = sine_value(sine_table, p); // [1, -1]
     y /= 2; // [0.5, -0.5]
     y += 0.5; // [1, 0]
-    if (up) {
-        y = 1 - y; // [0, 1]
+    y = 1 - y; // [0, 1]
+
+    const diff = to - from;
+    return from + (y * diff);
+}
+
+test cosine_interpolate {
+    const sine_table = create_sine_table(128);
+    for (0..100) |i| {
+        const frac = @as(f32, @floatFromInt(i)) / 100.0;
+        const expected = @cos((1.0 + frac) * std.math.pi) / 2.0 + 0.5;
+        const res = cosine_interpolate(&sine_table, 0, 1, frac);
+        try std.testing.expectApproxEqAbs(expected, res, 0.0005);
     }
-    return y;
 }
 
 pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
