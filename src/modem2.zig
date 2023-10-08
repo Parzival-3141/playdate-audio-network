@@ -10,7 +10,7 @@ pub const OscillatorRates = extern struct {
     /// Returns a set of oscillator phase rates (inverse frequencies) that are optimal for
     /// Goertzel detection with N DFT terms at the given sample rate.
     ///
-    /// One symbol requires 12 unique frequencies, in increasing order:
+    /// One symbol requires 13 unique frequencies, in increasing order:
     /// - Two for the clock oscillator, alternating low/high (FSK)
     /// - Three for the header oscillator, disconnected/connected/payload (FSK)
     /// - Eight for each payload bit oscillator, in least to most signifcant order (ASK)
@@ -151,14 +151,6 @@ pub fn Modulator(comptime N: u16, comptime sample_rate: f32, comptime baud: f32,
             }
         }
     };
-}
-
-pub fn welch_window(y: f32, n: f32, N: f32) f32 {
-    var w = n - (N / 2);
-    w /= (N / 2);
-    w *= w;
-    w = 1 - w;
-    return y * w;
 }
 
 /// Creates a sinusoidal lookup table of the given length.
