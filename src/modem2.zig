@@ -12,7 +12,7 @@ pub const OscillatorRates = extern struct {
     ///
     /// One symbol requires 13 unique frequencies, in increasing order:
     /// - Two for the clock oscillator, alternating low/high (FSK)
-    /// - Three for the header oscillator, disconnected/connected/payload (FSK)
+    /// - Three for the header oscillator, waiting/ready/payload (FSK)
     /// - Eight for each payload bit oscillator, in least to most signifcant order (ASK)
     pub fn init(N: u16, sample_rate: f32) OscillatorRates {
         const base_freq = sample_rate / @as(f32, @floatFromInt(N));
@@ -32,6 +32,12 @@ pub const OscillatorRates = extern struct {
     }
 };
 
+pub const Symbol = union(enum) {
+    waiting,
+    ready,
+    payload: u8,
+};
+
 /// Creates a type that modulates data as an audio signal.
 /// The signal uses a combination of frequency-shift keying (FSK) and amplitude-shifk keying (ASK).
 /// Sine waves are generated using a lookup table of the given length.
@@ -48,22 +54,16 @@ pub fn Modulator(
         const Mod = @This();
 
         const N_float: comptime_float = @floatFromInt(N);
-        const window_len_float = sample_rate / baud;
-        pub const window_len: u16 = @intFromFloat(window_len_float);
+        const symbol_len_float = sample_rate / baud;
+        pub const symbol_len: u16 = @intFromFloat(symbol_len_float);
         comptime {
-            if (window_len_float != @as(comptime_float, @floatFromInt(window_len))) {
+            if (symbol_len_float != @as(comptime_float, @floatFromInt(symbol_len))) {
                 @compileError("baud must be integer divisible by sample rate");
             }
         }
 
         pub const sine_scaling = 0.2;
         pub const sine_table = create_sine_table(sine_table_len);
-
-        pub const Symbol = union(enum) {
-            disconnected,
-            connected,
-            payload: u8,
-        };
 
         clock_osc: Oscillator,
         clock_osc_fm: Oscillator,
@@ -78,7 +78,7 @@ pub fn Modulator(
                 .clock_osc_fm = .{
                     // Initial phase is offset such that the clock freqs are strongest
                     // at the center of the the significant N samples of the window.
-                    .phase = 1.0 - (N_float / 2.0) / window_len_float,
+                    .phase = 1.0 - (N_float / 2.0) / symbol_len_float,
                 },
                 .header_osc = .{},
                 .payload_oscs = .{.{}} ** 8,
@@ -90,7 +90,7 @@ pub fn Modulator(
         /// Generate signal for the value (or no-op) into buf.
         /// Buf must be large enough to store one symbol period.
         pub fn modulate(mod: *Mod, symbol: Symbol, buf: []f32) void {
-            for (buf[0..window_len]) |*out| {
+            for (buf[0..symbol_len]) |*out| {
                 // Get clock FM value, which oscillates between the two clock frequencies.
                 // TODO: This should be precalclated in OscillatorRates.
                 const diff = rates.clock[1] - rates.clock[0];
@@ -106,11 +106,11 @@ pub fn Modulator(
 
             // The number of samples used to smoothly ramp from an old frequency or amplitude to a new one.
             // This transition helps avoid creating bursts of energy in higher frequencies (noise).
-            const transition_samples = window_len - N;
+            const transition_samples = symbol_len - N;
 
             {
                 var start: u32 = 0;
-                var len: u32 = window_len;
+                var len: u32 = symbol_len;
 
                 const header = @intFromEnum(symbol);
                 if (header != mod.last_header) {
@@ -155,7 +155,7 @@ pub fn Modulator(
                 }
 
                 var start: u32 = 0;
-                var len: u32 = window_len;
+                var len: u32 = symbol_len;
 
                 if (bit_set != last_bit_set) {
                     // Transition from old amplitude to new
@@ -194,12 +194,12 @@ test Modulator {
     const M = Modulator(31, 44100, 882, 64);
     var m = M.init();
     var buf: [100]f32 = undefined;
-    m.modulate(.disconnected, &buf);
-    m.modulate(.disconnected, &buf);
-    m.modulate(.connected, &buf);
+    m.modulate(.waiting, &buf);
+    m.modulate(.waiting, &buf);
+    m.modulate(.ready, &buf);
     m.modulate(.{ .payload = 'h' }, &buf);
     m.modulate(.{ .payload = 'i' }, &buf);
-    m.modulate(.connected, &buf);
+    m.modulate(.ready, &buf);
 }
 
 /// Creates a sinusoidal lookup table of the given length.
@@ -427,26 +427,18 @@ pub const Oscillator = struct {
     /// Current phase of the sine wave in range [0, 1).
     phase: f32 = 0,
 
-    var called: usize = 0;
-
     /// Produce the next oscillator amplitude and advance phase by phase_incr.
     /// Phase increment can be calculated with (freq / sample_rate);
     /// it is provided as a parameter instead of frequency because for this package because
     /// it is more effecient to precalculate the phase_incrs of a finite set of frequencies.
     ///
-    /// phase_incr is asserted to be positive.
-    pub fn generate(osc: *Oscillator, comptime sine_table: []const f32, phase_incr: f32) f32 {
+    /// phase_incr is asserted to be in the range [0, 0.5) to avoid crossing the Nyquist rate.
+    pub fn generate(osc: *Oscillator, sine_table: []const f32, phase_incr: f32) f32 {
         std.debug.assert(phase_incr >= 0);
         std.debug.assert(phase_incr < 0.5);
-        std.debug.assert(osc.phase <= 1 and osc.phase >= 0);
+        std.debug.assert(osc.phase >= 0 and osc.phase < 1);
 
-        const index_float = osc.phase * sine_table.len;
-        const index: u32 = @intFromFloat(index_float);
-        const frac = index_float - @as(f32, @floatFromInt(index));
-
-        const y1 = sine_table[index % sine_table.len];
-        const y2 = sine_table[(index + 1) % sine_table.len];
-        const out = y1 * (1 - frac) + (y2 * frac);
+        const out = sine_value(sine_table, osc.phase);
 
         osc.phase += phase_incr;
         while (osc.phase >= 1) osc.phase -= 1;
