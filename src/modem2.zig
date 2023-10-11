@@ -263,141 +263,549 @@ test cosine_interpolate {
     }
 }
 
-pub fn Demodulator(comptime N: u16, comptime sample_rate: f32) type {
-    const freqs = SymbolFrequencies.init(N, sample_rate);
+pub fn Demodulator(
+    comptime N: u16,
+    comptime sample_rate: comptime_float,
+    comptime baud: comptime_float,
+) type {
+    if (baud <= 0) {
+        @compileError("baud must be greater than 0");
+    }
+
+    const rates = OscillatorRates.init(N, sample_rate);
 
     return struct {
-        pub const Demod = @This();
+        const Demod = @This();
 
-        pub const Error = error{NoSignal};
+        const N_float: comptime_float = @floatFromInt(N);
 
-        pub const State = enum {
+        const symbol_len_float = sample_rate / baud;
+        pub const symbol_len: u16 = @intFromFloat(symbol_len_float);
+        comptime {
+            if (symbol_len_float != @as(comptime_float, @floatFromInt(symbol_len))) {
+                @compileError("baud must be integer divisible by sample rate");
+            }
+        }
+
+        const padding_count = symbol_len - N;
+        const lookaround_count = 2;
+
+        comptime {
+            std.debug.assert(lookaround_count < N);
+            std.debug.assert(lookaround_count < padding_count);
+        }
+        const near_sync_samples_needed = N + (2 * lookaround_count);
+        const full_sync_samples_needed = symbol_len + N;
+
+        pub const ClockState = union(enum) {
             start,
-            clock_low,
-            clock_high,
+            set: u1,
         };
 
-        // last_clock: bool,
-        state: State,
-        // buf: [N]f32,
-        // buf_index: u16,
+        clock_state: ClockState,
+        near_sync_countdown: u16,
+        /// Buffer of incoming samples taken from the incoming signal stream.
+        /// Only used when the slice passed to demodulate() does not have enough samples to support
+        /// the given analysis (normally N, but more for full or partial sync).
+        buffer: [full_sync_samples_needed]f32,
+        /// How many values are currently in the buffer.
+        buffer_items: u16,
+        /// How many samples should be dropped before acquiring the next meaningful slice.
+        buffer_skip_samples: u16,
 
         pub fn init() Demod {
             return .{
-                // .last_clock = false,
-                .state = .start,
-                // .buf = &[0]f32{},
-                // .buf_index = 0,
+                .clock_state = .start,
+                .near_sync_countdown = 10,
+                .buffer = undefined,
+                .buffer_items = 0,
+                .buffer_skip_samples = 0,
             };
         }
 
-        /// Get the ratio of the higher value to the lower value.
-        /// Bounds are set to prevent NaN and Inf.
-        /// Also returns the higher of the two values.
-        fn magnitude_ratio(a: f32, b: f32) struct { f32, u1 } {
-            std.debug.assert(a >= 0);
-            std.debug.assert(b >= 0);
+        pub const Result = struct {
+            /// Number of samples read.
+            /// Caller should advance signal cursor by this amount after calling.
+            usize,
+            /// Status of analysis.
+            union(enum) {
+                /// The incoming signal did not yield a strong signal,
+                /// or the detected clock was an unexpected value.
+                /// On this status, state is reset and the next call to demodulate()
+                /// will invoke a full re-sync.
+                disconnected,
+                /// Signal was in tact.
+                symbol: Symbol,
+            },
+        };
 
-            var lower = a;
-            var higher = b;
-            var sel: u1 = 1;
-            if (lower > higher) {
-                lower = b;
-                higher = a;
-                sel = 0;
-            }
+        /// Reads as many samples as needed from signal to decode a single symbol,
+        /// buffering internally for future calls if needed. Once enough samples are read,
+        /// returns either the decoded symbol or .disconnected if the remote signal is not
+        /// strong or clear enough.
+        ///
+        /// Returns null if more samples are needed to decode the next symbol, in which case
+        /// the end of `signal` was reached.
+        pub fn demodulate(d: *Demod, signal: []const f32) ?Result {
+            std.log.debug("demodulating symbol", .{});
 
-            lower = std.math.clamp(lower, 0.00001, 100.0);
-            higher = std.math.clamp(higher, 0.00001, 100.0);
+            const clock_res = switch (d.clock_state) {
+                .start => res: {
+                    break :res d.check_clock_full_sync(signal, 6) orelse return null;
+                },
+                .set => res: {
+                    if (d.near_sync_countdown == 0) {
+                        d.near_sync_countdown = 10;
+                        break :res d.check_clock_near_sync(signal) orelse return null;
+                    } else {
+                        d.near_sync_countdown -= 1;
+                        break :res d.check_clock_no_sync(signal) orelse return null;
+                    }
+                },
+            };
 
-            return .{ higher / lower, sel };
-        }
+            const read, const status = clock_res;
+            const analysis_slice = switch (status) {
+                .weak_signal, .wrong_clock => return .{ read, .disconnected },
+                .ok => |slice| slice,
+            };
 
-        pub fn demodulate(demod: *Demod, signal: []const f32) Error!?u8 {
-            std.log.debug("----", .{});
-
-            var high_mag: f32 = undefined;
             {
-                const clk0 = goertzel(N, signal, freqs.clock[0]);
-                const clk1 = goertzel(N, signal, freqs.clock[1]);
-                // TODO: upgrade zig and destructure
-                const cmp = magnitude_ratio(clk0, clk1);
-                const ratio = cmp[0];
-                const higher = cmp[1];
-
-                std.log.debug("clk: {d} | {d} | {d}", .{ clk0, clk1, ratio });
-
-                // TODO: resync here
-                if (ratio < 100) {
-                    demod.state = .start;
-                    return error.NoSignal;
+                const hdr0 = goertzel(N, analysis_slice, rates.header[0]);
+                const hdr1 = goertzel(N, analysis_slice, rates.header[1]);
+                const hdr2 = goertzel(N, analysis_slice, rates.header[2]);
+                const sel, const ratio = select_magnitude(&.{ hdr0, hdr1, hdr2 });
+                if (ratio < 1000) {
+                    d.* = init();
+                    return .{ read, .disconnected };
                 }
-                const high = higher == 1;
-                high_mag = ([2]f32{ clk0, clk1 })[higher];
 
-                // demod.last_clock = high;
+                std.log.debug("hdr:  {d} | {d} | {d}", .{ hdr0, hdr1, hdr2 });
 
-                // Same clock value twice in a row results in a re-sync.
-                switch (demod.state) {
-                    .start => {
-                        demod.state = if (high) .clock_high else .clock_low;
-                    },
-                    .clock_low => {
-                        if (high) {
-                            demod.state = .clock_high;
-                        } else {
-                            demod.state = .start;
-                            return error.NoSignal;
-                        }
-                    },
-                    .clock_high => {
-                        if (high) {
-                            demod.state = .start;
-                            return error.NoSignal;
-                        } else {
-                            demod.state = .clock_low;
-                        }
-                    },
+                switch (@as(u2, @intCast(sel))) {
+                    0 => return .{ read, .{ .symbol = .waiting } },
+                    1 => return .{ read, .{ .symbol = .ready } },
+                    2 => {}, // below
+                    3 => unreachable,
                 }
-            }
-
-            const data = blk: {
-                const data0 = goertzel(N, signal, freqs.data[0]);
-                const data1 = goertzel(N, signal, freqs.data[1]);
-                // TODO: upgrade zig and destructure
-                const cmp = magnitude_ratio(data0, data1);
-                const ratio = cmp[0];
-                const higher = cmp[1];
-
-                std.log.debug("data: {d} | {d} | {d}", .{ data0, data1, ratio });
-
-                // TODO: resync here
-                if (ratio < 100) {
-                    demod.state = .start;
-                    return error.NoSignal;
-                }
-                const high = higher == 1;
-
-                break :blk high;
-            };
-
-            if (!data) {
-                return null;
             }
 
             var byte: u8 = 0;
-            for (freqs.payload, 0..) |freq, i| {
-                const mag = goertzel(N, signal, freq);
-                const target_mag = high_mag / 20;
-                std.log.debug("freq {d} | mag {d} | target {d}", .{ i, mag, target_mag });
+            for (rates.payload, 0..) |rate, bit| {
+                const mag = goertzel(N, analysis_slice, rate);
+                const target_mag = 2.0; // TODO
                 const val: u8 = @intFromBool(mag > target_mag); // TODO
-                const mask: u8 = val << @intCast(i);
+                const mask: u8 = val << @intCast(bit);
                 byte |= mask;
+
+                std.log.debug("bit  {d} | mag {d} | target {d}", .{ bit, mag, target_mag });
             }
 
-            return byte;
+            return .{ read, .{ .symbol = .{ .payload = byte } } };
+        }
+
+        /// When successful, returns the amount read and a slice of `needed` samples.
+        /// If signal is long enough and internal buffering is not already in progress,
+        /// the signal slice is used directly to avoid copying.
+        /// Otherwise, buffers incoming signal until `needed` samples has been collected.
+        /// Until enough samples are ready, returns null.
+        fn collect_signal(d: *Demod, signal: []const f32, needed: usize) ?struct { usize, []const f32 } {
+            if (d.buffer_skip_samples > signal.len) {
+                d.buffer_skip_samples -= @intCast(signal.len);
+                return null;
+            }
+
+            const sig = signal[d.buffer_skip_samples..];
+            d.buffer_skip_samples = 0;
+
+            // Happy path: no buffering was needed.
+            if (d.buffer_items == 0 and sig.len >= needed) {
+                return .{ needed, sig[0..needed] };
+            }
+
+            // Otherwise, either the signal slice is too short or we need to append to
+            // an in-progress buffering.
+            const copy_count: u16 = @intCast(needed - d.buffer_items);
+            if (copy_count < sig.len) {
+                @memcpy(d.buffer[d.buffer_items..][0..copy_count], sig[0..copy_count]);
+                d.buffer_items += copy_count;
+                return .{ copy_count, d.buffer[0..needed] };
+            } else {
+                @memcpy(d.buffer[d.buffer_items..][0..sig.len], sig);
+                d.buffer_items += @intCast(sig.len);
+                return null;
+            }
+        }
+
+        test collect_signal {
+            var d = Demod.init();
+            const static_signal: [full_sync_samples_needed]f32 = undefined;
+
+            const Step = struct {
+                skip: ?u16 = null,
+                sig: []const f32,
+                needed: u16,
+                res: ?struct { usize, []const f32 },
+                buffer_items: u16,
+                reset: bool = false,
+            };
+            const steps: []const Step = &.{
+                .{
+                    .sig = &static_signal,
+                    .needed = 0,
+                    .res = .{ 0, static_signal[0..0] },
+                    .buffer_items = 0,
+                },
+                .{
+                    .sig = &static_signal,
+                    .needed = 1,
+                    .res = .{ 1, static_signal[0..1] },
+                    .buffer_items = 0,
+                },
+                .{
+                    .sig = static_signal[0..symbol_len],
+                    .needed = symbol_len,
+                    .res = .{ symbol_len, static_signal[0..symbol_len] },
+                    .buffer_items = 0,
+                },
+                .{
+                    .sig = static_signal[0..symbol_len],
+                    .needed = symbol_len + 1,
+                    .res = null,
+                    .buffer_items = symbol_len,
+                },
+                .{
+                    .sig = static_signal[0..symbol_len],
+                    .needed = symbol_len + 1,
+                    .res = .{ 1, d.buffer[0 .. symbol_len + 1] },
+                    .buffer_items = symbol_len + 1,
+                },
+                .{ // part 1
+                    .reset = true,
+                    .skip = full_sync_samples_needed / 2,
+                    .sig = &static_signal,
+                    .needed = full_sync_samples_needed,
+                    .res = null,
+                    .buffer_items = static_signal.len - (full_sync_samples_needed / 2),
+                },
+                .{ // part 2
+                    .sig = &static_signal,
+                    .needed = full_sync_samples_needed,
+                    .res = .{ full_sync_samples_needed / 2, d.buffer[0..full_sync_samples_needed] },
+                    .buffer_items = full_sync_samples_needed,
+                },
+            };
+
+            for (steps) |step| {
+                if (step.reset) {
+                    d.buffer_items = 0;
+                }
+                if (step.skip) |amount| {
+                    d.buffer_skip_samples = amount;
+                }
+                const res = d.collect_signal(step.sig, step.needed);
+                try std.testing.expectEqual(step.res, res);
+                try std.testing.expectEqual(step.buffer_items, d.buffer_items);
+            }
+        }
+
+        const SyncResult = struct {
+            usize,
+            union(enum) {
+                weak_signal,
+                wrong_clock,
+                ok: []const f32,
+            },
+        };
+
+        /// Analyzes signal to try to find clock peak, corresponding to
+        /// optimal analysis offset. Does a binary search for the highest magnitude
+        /// ratio of one clock value to the other over a full symbol period.
+        /// If the signal slice does not have enough samples for that check,
+        /// buffers as many as possible for the next call.
+        ///
+        /// Whichever clock value is detected as strongest is set as the clock state,
+        /// and successive windows are expected to alternate clock values.
+        fn check_clock_full_sync(d: *Demod, signal: []const f32, max_iters: u8) ?SyncResult {
+            const read, const sig = d.collect_signal(signal, full_sync_samples_needed) orelse return null;
+
+            var center: f32 = symbol_len / 2;
+            var distance: f32 = symbol_len / 4;
+            var iter: u16 = 0;
+
+            var clock_sel: u1 = undefined;
+            var ratio: f32 = 1;
+            var prev_clock_sel: u1 = undefined;
+            var prev_ratio: f32 = 1;
+
+            while (distance >= 0.5 and iter < max_iters) : ({
+                iter += 1;
+                distance /= 2;
+                prev_clock_sel = clock_sel;
+                prev_ratio = ratio;
+            }) {
+                const positions = [2]f32{
+                    center - distance, // left
+                    center + distance, // right
+                };
+
+                const left_chunk = sig[@intFromFloat(positions[0])..][0..N];
+                const right_chunk = sig[@intFromFloat(positions[1])..][0..N];
+
+                const mags = [4]f32{
+                    goertzel(N, left_chunk, rates.clock[0]),
+                    goertzel(N, left_chunk, rates.clock[1]),
+                    goertzel(N, right_chunk, rates.clock[0]),
+                    goertzel(N, right_chunk, rates.clock[1]),
+                };
+
+                const new_sel, const new_ratio = select_magnitude(&mags);
+                if (new_ratio > prev_ratio) {
+                    clock_sel = @as(u1, @intCast(new_sel % 2));
+                    ratio = new_ratio;
+                    center = positions[new_sel / 2];
+                }
+            }
+
+            if (ratio < 1000) {
+                d.* = Demod.init();
+                return .{ read, .weak_signal };
+            }
+            d.clock_state = .{ .set = clock_sel };
+
+            // Resolved analysis window.
+            const start: usize = @intFromFloat(center);
+            const slice = sig[start..][0..N];
+
+            // TODO: It should be possible to "unread" by as much as lookaround_count
+            // to avoid copying into the buffer so successive calls can always avoid
+            // relying on the buffer when incoming signal is long enough.
+            // As is, the buffer is always used.
+
+            // The position of the next meaningful symbol portion, minus look-behind.
+            const next_needed_sample_pos = start + symbol_len - lookaround_count;
+            if (next_needed_sample_pos < d.buffer_items) {
+                // Some of what we need for the next analysis (look-behind, N, look-ahead)
+                // is already in the current slice. Move as many as possible to the start
+                // of the buffer for the next run.
+                const to_move = sig[next_needed_sample_pos..];
+                for (to_move, d.buffer[0..to_move.len]) |src, *dst| {
+                    dst.* = src;
+                }
+                d.buffer_skip_samples = 0;
+                d.buffer_items = @intCast(to_move.len);
+            } else {
+                d.buffer_skip_samples = @intCast(next_needed_sample_pos - d.buffer_items);
+                d.buffer_items = 0;
+            }
+
+            return .{ read, .{ .ok = slice } };
+        }
+
+        /// Analyzes signal to find clock peak and returns a slice of samples ready for symbol analysis.
+        /// This should only be called some time after a successful full sync was performed.
+        /// Differences with full sync:
+        ///
+        /// - Only searches a small, contiguous neighborhood around the current sync point.
+        ///   Normal drift is expected to be slight, so this window is only a few samples on
+        ///   either side of the current positioning.
+        /// - Expects the clock value to oscillate correctly. Full sync just picks whichever
+        ///   is strongest as the starting value.
+        fn check_clock_near_sync(d: *Demod, signal: []const f32) ?SyncResult {
+            const read, const sig = d.collect_signal(signal, near_sync_samples_needed) orelse return null;
+
+            const new_clock = d.clock_state.set +% 1;
+            const rate = rates.clock[new_clock];
+
+            // Check a sliding window of N samples to the left and right of current offset.
+            var start: u16 = 0;
+            var best_mag: f32 = -1;
+            for (0..(2 * lookaround_count)) |offset| {
+                const slice = sig[offset..][0..N];
+                const mag = goertzel(N, slice, rate);
+                if (mag > best_mag) {
+                    best_mag = mag;
+                    start = @intCast(offset);
+                } else break;
+            }
+            const analysis_slice = sig[start..][0..N];
+
+            // Compare to opposite clock frequency strength to ensure the remote clock
+            // is still oscillating correctly.
+            const opposite_clock_mag = goertzel(N, analysis_slice, rates.clock[d.clock_state.set]);
+
+            const sel, const ratio = select_magnitude(&.{ best_mag, opposite_clock_mag });
+            if (ratio < 1000) {
+                d.* = Demod.init();
+                return .{ read, .weak_signal };
+            }
+            if (sel != 0) {
+                d.* = Demod.init();
+                return .{ read, .wrong_clock };
+            }
+            d.clock_state = .{ .set = new_clock };
+
+            // TODO: It should be possible to "unread" by as much as lookaround_count
+            // to avoid copying into the buffer so successive calls can always avoid
+            // relying on the buffer when incoming signal is long enough.
+            // As is, the buffer is always used.
+
+            // The position of the next meaningful symbol portion, minus look-behind.
+            const next_needed_sample_pos = start + symbol_len - lookaround_count;
+            if (next_needed_sample_pos < d.buffer_items) {
+                // Some of what we need for the next analysis (look-behind, N, look-ahead)
+                // is already in the current slice. Move as many as possible to the start
+                // of the buffer for the next run.
+                const to_move = sig[next_needed_sample_pos..];
+                for (to_move, d.buffer[0..to_move.len]) |src, *dst| {
+                    dst.* = src;
+                }
+                d.buffer_skip_samples = 0;
+                d.buffer_items = @intCast(to_move.len);
+            } else {
+                d.buffer_skip_samples = next_needed_sample_pos - d.buffer_items;
+                d.buffer_items = 0;
+            }
+
+            return .{ read, .{ .ok = sig[start..][0..N] } };
+        }
+
+        /// Validates the clock of the incoming signal and returns a slice of samples ready for symbol analysis.
+        fn check_clock_no_sync(d: *Demod, signal: []const f32) ?SyncResult {
+            const read, var sig = d.collect_signal(signal, near_sync_samples_needed) orelse return null;
+            sig = sig[lookaround_count..][0..N];
+
+            const clk0 = goertzel(N, sig, rates.clock[0]);
+            const clk1 = goertzel(N, sig, rates.clock[1]);
+            const sel, const ratio = select_magnitude(&.{ clk0, clk1 });
+            if (ratio < 1000) {
+                d.* = Demod.init();
+                return .{ read, .weak_signal };
+            }
+            if (sel == d.clock_state.set) {
+                d.* = Demod.init();
+                return .{ read, .wrong_clock };
+            }
+            d.clock_state = .{ .set = @intCast(sel) };
+
+            const next_needed_sample_pos = symbol_len - lookaround_count;
+            // TODO: ensure this is always true by requiring (2*lookaround) < padding
+            std.debug.assert(next_needed_sample_pos >= d.buffer_items);
+            d.buffer_skip_samples = next_needed_sample_pos - d.buffer_items;
+            d.buffer_items = 0;
+
+            return .{ read, .{ .ok = sig } };
+        }
+
+        test check_clock_no_sync {
+            var d = Demod.init();
+            d.clock_state = .{ .set = 1 };
+            var sig: [near_sync_samples_needed]f32 = undefined;
+
+            // Fill with strong wave at 1x baud (low clock frequency) and weak wave at 2x baud
+            {
+                var phase: f32 = 0;
+                for (&sig) |*samp| {
+                    samp.* = @sin(phase);
+                    samp.* += (@sin(phase * 2) / 1200);
+                    phase += rates.clock[0] * 2 * std.math.pi;
+                }
+
+                const res = d.check_clock_no_sync(&sig).?;
+                const read, const status = res;
+                try std.testing.expectEqual(near_sync_samples_needed, @intCast(read));
+                try std.testing.expectEqual(@as([]const f32, sig[lookaround_count..][0..N]), status.ok);
+                try std.testing.expectEqual(@as(u1, 0), d.clock_state.set);
+
+                d.buffer_items = 0;
+                d.buffer_skip_samples = 0;
+            }
+
+            // Expected clock has been flipped;
+            // Fill with strong wave at 2x baud (low clock frequency) and weak wave at 1x baud
+            {
+                var phase: f32 = 0;
+                for (&sig) |*samp| {
+                    samp.* = @sin(phase);
+                    samp.* += (@sin(phase / 2) / 1200);
+                    phase += rates.clock[1] * 2 * std.math.pi;
+                }
+
+                const res = d.check_clock_no_sync(&sig).?;
+                const read, const status = res;
+                try std.testing.expectEqual(near_sync_samples_needed, @intCast(read));
+                try std.testing.expectEqual(@as([]const f32, sig[lookaround_count..][0..N]), status.ok);
+                try std.testing.expectEqual(@as(u1, 1), d.clock_state.set);
+
+                d.buffer_items = 0;
+                d.buffer_skip_samples = 0;
+            }
+
+            // Expected clock flipped again, so this should fail when given the previous signal
+            {
+                const res = d.check_clock_no_sync(&sig).?;
+                const read, const status = res;
+                try std.testing.expectEqual(near_sync_samples_needed, @intCast(read));
+                try std.testing.expect(status == .wrong_clock);
+            }
         }
     };
+}
+
+/// Returns the index of the highest value and the ratio of it to the second highest value.
+/// Compared values are clamped to a reasonable range to prevent NaN and Inf.
+fn select_magnitude(mags: []const f32) struct { u16, f32 } {
+    std.debug.assert(mags.len > 0);
+
+    var sel: u16 = 0;
+    var max_mag: f32 = 0;
+    var next_mag: f32 = 0;
+
+    for (mags, 0..) |mag, i| {
+        std.debug.assert(mag >= 0);
+        if (mag > max_mag) {
+            sel = @intCast(i);
+            next_mag = max_mag;
+            max_mag = mag;
+        } else if (mag > next_mag) {
+            next_mag = mag;
+        }
+    }
+
+    next_mag = std.math.clamp(next_mag, 0.00001, 1000.0);
+    max_mag = std.math.clamp(max_mag, 0.00001, 1000.0);
+
+    return .{ sel, max_mag / next_mag };
+}
+
+test select_magnitude {
+    const Case = struct {
+        mags: []const f32,
+        sel: u16,
+        ratio: f32,
+    };
+    const cases: []const Case = &.{
+        .{
+            .mags = &.{ 10, 20 },
+            .sel = 1,
+            .ratio = 2.0,
+        },
+        .{
+            .mags = &.{ 90, 20 },
+            .sel = 0,
+            .ratio = 4.5,
+        },
+        .{
+            .mags = &.{ 10, 25, 0.5, 40, 20 },
+            .sel = 3,
+            .ratio = 1.6,
+        },
+    };
+    for (cases) |c| {
+        const sel, const ratio = select_magnitude(c.mags);
+        try std.testing.expectEqual(c.sel, sel);
+        try std.testing.expectApproxEqAbs(c.ratio, ratio, 0.001);
+    }
 }
 
 /// Calculates the power of the given frequency within the input sample slice.
@@ -447,38 +855,61 @@ pub const Oscillator = struct {
     }
 };
 
+test Demodulator {
+    _ = Demodulator(31, 44_100, 882);
+}
+
 test "modulate and demodulate symbols" {
-    const N = 30;
+    // try test_modulate_and_demodulate(31, 44_100, 882);
+    // try test_modulate_and_demotulate(31, 44_100, 44.1);
+    // try test_modulate_and_demotulate(31, 1_000, 1);
+    // try test_modulate_and_demotulate(60, 10_000, 1);
+    // try test_modulate_and_demotulate(60, 12_000, 20);
+}
 
-    var mod = Modulator(N, 44_100, 64).init();
-    var demod = Demodulator(N, 44_100).init();
+fn test_modulate_and_demodulate(
+    comptime N: u16,
+    comptime sample_rate: comptime_float,
+    comptime baud: comptime_float,
+) !void {
+    const Mod = Modulator(N, sample_rate, baud, 64);
+    const Demod = Demodulator(N, sample_rate, baud);
 
-    const payloads = [_]?u8{
-        null, null, null, null,
-        'z',  'i',  'g',  '.',
-        '.',  '.',  ' ',  null,
-        null, null, null, null,
-        'H',  'I',  ',',  ' ',
-        'M',  'O',  'M',  '!',
-        null, null, null, null,
+    var mod = Mod.init();
+    var demod = Demod.init();
+
+    const symbols = [_]Symbol{
+        .waiting,            .waiting,            .waiting,            .ready,
+        .{ .payload = 't' }, .{ .payload = 'a' }, .{ .payload = 'c' }, .{ .payload = 'o' },
+        .{ .payload = 'h' }, .{ .payload = 'a' }, .{ .payload = 't' }, .ready,
+        .ready,              .ready,              .ready,              .ready,
     };
 
-    var signal = [_]f32{0} ** (N * payloads.len);
+    var signal: [Mod.symbol_len]f32 = undefined;
+    var results: [symbols.len]Symbol = undefined;
+    var results_index: usize = 0;
 
-    for (payloads, 0..) |p, i| {
-        mod.modulate(p, signal[i * N ..]);
+    for (symbols, 0..) |sym, i| {
+        mod.modulate(sym, &signal);
+
+        var sig: []const f32 = &signal;
+        while (demod.demodulate(sig)) |res| {
+            const read, const status = res;
+            sig = sig[read..];
+            switch (status) {
+                .disconnected => {
+                    std.debug.panic("could not demodulate; iter {d}, expected {}", .{ i, sym });
+                },
+                .symbol => |s| {
+                    results[results_index] = s;
+                    results_index += 1;
+                },
+            }
+        }
     }
 
-    for (payloads, 0..) |p, i| {
-        const sym = try demod.demodulate(signal[N * i ..]);
-
-        // TODO: Use testing log instead of panicking to see which iteration failed.
-        // https://github.com/ziglang/zig/issues/5738
-        std.testing.expectEqual(p == null, sym == null) catch {
-            std.debug.panic("payload null mismatch on iter {}", .{i});
-        };
-        std.testing.expectEqual(p, sym) catch {
-            std.debug.panic("symbol mismatch on iter {}: expected {?c} ({?x}), got {?c} ({?x})", .{ i, p, p, sym, sym });
-        };
-    }
+    // The last symbol is not expected to have been decoded because
+    // the demodulator always needs some lookahead samples.
+    try std.testing.expectEqual(@as(usize, 15), results_index);
+    try std.testing.expectEqualSlices(Symbol, symbols[0..15], results[0..15]);
 }
