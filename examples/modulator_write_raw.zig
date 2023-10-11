@@ -12,38 +12,61 @@ pub const std_options = struct {
 
 const modem = @import("modem").modem2;
 
+const sample_rate: f32 = 44_100;
+const N = 31;
+const baud = 882;
+
+const Modulator = modem.Modulator(N, sample_rate, baud, 64);
+const Demodulator = modem.Demodulator(N, sample_rate, baud);
+var mod = Modulator.init();
+var demod = Demodulator.init();
+
+var sample_buf: [Modulator.symbol_len]f32 = undefined;
+
 pub fn main() !void {
-    const sample_rate: f32 = 44_100;
-    const N = 30;
-
-    var mod = modem.Modulator(N, sample_rate, 64).init();
-    var demod = modem.Demodulator(N, sample_rate).init();
-
-    const symbols = [_]?u8{
-        'z',  'i',  'g',  '.',
-        '.',  '.',  ' ',  null,
-        null, null, null, null,
-        null, null, null, null,
-        'H',  'I',  ',',  ' ',
-        'M',  'O',  'M',  '!',
-        '\n', null, null, null,
-        null, null, null, null,
+    const symbols = [_]modem.Symbol{
+        .waiting,            .waiting,            .waiting,            .ready,
+        .{ .payload = 't' }, .{ .payload = 'a' }, .{ .payload = 'c' }, .{ .payload = 'o' },
+        .{ .payload = 'h' }, .{ .payload = 'a' }, .{ .payload = 't' }, .ready,
+        .ready,              .ready,              .ready,              .ready,
     };
 
-    const stdout = std.io.getStdOut();
-    const stderr = std.io.getStdErr();
-    for (symbols) |sym| {
-        var buf: [N]f32 = undefined;
-        mod.modulate(sym, &buf);
-        for (buf) |float| {
-            const bytes: [4]u8 = @bitCast(float);
-            try stdout.writer().writeAll(&bytes);
-        }
+    for (symbols) |symbol| {
+        mod.modulate(symbol, &sample_buf);
+        try write_out_samples(&sample_buf);
+    }
 
-        const res = try demod.demodulate(&buf);
-        if (res) |byte| {
-            try stderr.writer().writeByte(byte);
-            try stderr.writer().print("{c}\t0x{x:0<2}\n", .{ byte, byte });
+    std.debug.print("\n", .{});
+    if (disconnects > 0) {
+        std.log.err("got {d} disconnected windows", .{disconnects});
+        std.os.exit(1);
+    }
+}
+
+var disconnects: usize = 0;
+
+fn write_out_samples(signal: []const f32) !void {
+    const stderr = std.io.getStdErr().writer();
+    const stdout = std.io.getStdOut().writer();
+
+    for (signal) |float| {
+        const buf_bytes: [4]u8 = @bitCast(float);
+        try stdout.writeAll(&buf_bytes);
+    }
+
+    var sig = signal;
+    while (demod.demodulate(signal)) |res| {
+        const read, const status = res;
+        sig = sig[read..];
+        switch (status) {
+            .disconnected => {
+                try stderr.writeByte('*');
+                disconnects += 1;
+            },
+            .symbol => |symbol| switch (symbol) {
+                .waiting, .ready => {},
+                .payload => |byte| try stderr.writeByte(byte),
+            },
         }
     }
 }

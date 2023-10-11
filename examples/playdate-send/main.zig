@@ -1,6 +1,6 @@
 const std = @import("std");
 const pdapi = @import("playdate");
-const Modulator = @import("modem").modem2.Modulator;
+const modem = @import("modem").modem2;
 
 var g_playdate_image: *pdapi.LCDBitmap = undefined;
 var playdate: *pdapi.PlaydateAPI = undefined;
@@ -186,8 +186,8 @@ fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     }
 }
 
-const modulator_N = 30;
-var modulator = Modulator(modulator_N, 44_100, 64).init();
+const Modulator = modem.Modulator(31, 44_100, 882, 64);
+var modulator = Modulator.init();
 var modulator_sample_count: u16 = 0;
 const modulator_data: []const u8 =
     \\One morning, as Gregor Samsa was waking up from anxious dreams, he
@@ -202,7 +202,7 @@ const modulator_data: []const u8 =
 ;
 var modulator_data_index: u16 = 0;
 
-var next_symbol_signal_buf: [modulator_N]f32 = undefined;
+var next_symbol_signal_buf: [Modulator.symbol_len]f32 = undefined;
 var next_symbol_ready = false;
 var next_symbol_index: u16 = 0;
 
@@ -211,10 +211,11 @@ fn generate_modulated_data(left: [*]i16, right: [*]i16, count: u32) callconv(.C)
         dead.* = 0;
 
         if (!next_symbol_ready) {
-            const char = modulator_data[modulator_data_index];
+            var symbol: modem.Symbol = undefined;
+            symbol = .{ .payload = modulator_data[modulator_data_index] };
             modulator_data_index = @intCast((modulator_data_index + 1) % modulator_data.len);
 
-            modulator.modulate(char, &next_symbol_signal_buf);
+            modulator.modulate(symbol, &next_symbol_signal_buf);
             next_symbol_ready = true;
             next_symbol_index = 0;
         }
