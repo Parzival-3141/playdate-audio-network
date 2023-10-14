@@ -752,6 +752,14 @@ pub fn Demodulator(
     };
 }
 
+fn test_write_sine_mixed(out: []f32, rate: f32, amp: f32, init_phase: f32) void {
+    var phase: f32 = init_phase;
+    for (out) |*samp| {
+        samp.* += @sin(phase * 2 * std.math.pi) * amp;
+        phase += rate;
+    }
+}
+
 /// Returns the index of the highest value and the ratio of it to the second highest value.
 /// Compared values are clamped to a reasonable range to prevent NaN and Inf.
 fn select_magnitude(mags: []const f32) struct { u16, f32 } {
@@ -819,15 +827,74 @@ pub fn goertzel(N: u16, buf: []const f32, normalized_frequency: f32) f32 {
 
     var s_prev: f32 = 0;
     var s_prev2: f32 = 0;
+    var total_power: f32 = 0;
 
     for (0..N) |i| {
-        const s = buf[i] + (coeff * s_prev) - s_prev2;
+        const samp = buf[i];
+        const s = samp + (coeff * s_prev) - s_prev2;
+        total_power += samp * samp;
         s_prev2 = s_prev;
         s_prev = s;
     }
 
-    // TODO: scale power based on N
-    return (s_prev2 * s_prev2) + (s_prev * s_prev) - (coeff * s_prev * s_prev2);
+    // Scaling the power by N squared makes it predictable for any value of N.
+    const power = (s_prev2 * s_prev2) + (s_prev * s_prev) - (coeff * s_prev * s_prev2);
+    const NN: f32 = @floatFromInt(N * N);
+    return power / NN;
+}
+
+test goertzel {
+    var buf: [100]f32 = undefined;
+    try test_goertzel(&buf, 31, &.{.{ .k = 1 }}, 1, 0.25); // simple case
+    try test_goertzel(&buf, 31, &.{.{ .k = 1, .phase = 0.321 }}, 1, 0.25); // initial phase has no effect
+    try test_goertzel(&buf, 31, &.{.{ .k = 2 }}, 2, 0.25); // k has no effect
+    try test_goertzel(&buf, 31, &.{.{ .k = 7 }}, 7, 0.25); // yet another k
+    try test_goertzel(&buf, 70, &.{.{ .k = 1 }}, 1, 0.25); // N has no effect
+    try test_goertzel(&buf, 70, &.{.{ .k = 33 }}, 33, 0.25); // different N and k
+    try test_goertzel(&buf, 31, &.{.{ .k = 1, .amp = 0.1 }}, 1, 0.0025); // below unity gain
+    try test_goertzel(&buf, 31, &.{.{ .k = 1, .amp = 4.0 }}, 1, 4.0); // above unity gain
+    try test_goertzel(&buf, 100, &.{.{ .k = 33, .amp = 2.0 }}, 33, 1.0); // above unity gain, different N and k
+    try test_goertzel(&buf, 31, &.{.{ .k = 5.1 }}, 5, 0.2366493); // signal is not perfectly k-aligned
+    try test_goertzel(&buf, 31, &.{.{ .k = 5.5 }}, 5, 0.1069222); // signal is even less k-aligned
+    try test_goertzel(&buf, 31, &.{.{ .k = 6.1 }}, 5, 0.001631582); // non-k-alinged non-target component causes spectral leakage
+    try test_goertzel(&buf, 31, &.{.{ .k = 6 }}, 5, 0.0); // k-aligned non-target component goes by undetected
+    try test_goertzel(&buf, 31, &.{ // several components present
+        .{ .k = 1, .amp = 0.1, .phase = 0.1 },
+        .{ .k = 2, .amp = 0.1, .phase = 0.2 },
+        .{ .k = 3, .amp = 0.1, .phase = 0.3 },
+        .{ .k = 4, .amp = 0.5, .phase = 0.4 }, // target
+        .{ .k = 5, .amp = 0.1, .phase = 0.5 },
+        .{ .k = 6, .amp = 0.1, .phase = 0.6 },
+    }, 4, 0.0625);
+    try test_goertzel(&buf, 31, &.{ // several non-k-aligned components present
+        .{ .k = 0.987, .amp = 0.1, .phase = 0.1 },
+        .{ .k = 2.1198, .amp = 0.1, .phase = 0.2 },
+        .{ .k = 4, .amp = 0.5, .phase = 0.3 }, // target
+        .{ .k = 6.42387, .amp = 0.1, .phase = 0.4 },
+    }, 4, 0.0610713);
+}
+
+fn test_goertzel(
+    buf: []f32,
+    N: u16,
+    sines: []const struct {
+        /// k/N = normalized frequency for any sample rate
+        k: f32,
+        amp: f32 = 1,
+        phase: f32 = 0,
+    },
+    /// Analyze this bin
+    target_k: f32,
+    mag: f32,
+) !void {
+    @memset(buf, 0);
+    const N_float: f32 = @floatFromInt(N);
+    for (sines) |sine| {
+        test_write_sine_mixed(buf, sine.k / N_float, sine.amp, sine.phase);
+    }
+    const target_freq = target_k / N_float;
+    const res = goertzel(N, buf, target_freq);
+    try std.testing.expectApproxEqAbs(mag, res, 0.00001);
 }
 
 /// Sine wave oscillator that uses a lookup table with linear interpolation.
