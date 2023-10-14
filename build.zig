@@ -63,6 +63,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
+    tests.filter = b.option([]const u8, "test-filter", "Filter tests by name");
 
     const tests_run_cmd = b.addRunArtifact(tests);
 
