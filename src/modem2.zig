@@ -827,12 +827,10 @@ pub fn goertzel(N: u16, buf: []const f32, normalized_frequency: f32) f32 {
 
     var s_prev: f32 = 0;
     var s_prev2: f32 = 0;
-    var total_power: f32 = 0;
 
     for (0..N) |i| {
         const samp = buf[i];
         const s = samp + (coeff * s_prev) - s_prev2;
-        total_power += samp * samp;
         s_prev2 = s_prev;
         s_prev = s;
     }
