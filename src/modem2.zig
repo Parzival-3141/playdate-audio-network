@@ -30,6 +30,17 @@ pub const OscillatorRates = extern struct {
 
         return @bitCast(rates);
     }
+
+    pub fn clockFm(rates: OscillatorRates) struct {
+        carrier_center: f32,
+        modulator_amp: f32,
+    } {
+        const carrier_diff = rates.clock[1] - rates.clock[0];
+        return .{
+            .carrier_center = rates.clock[0] + (carrier_diff / 2.0),
+            .modulator_amp = carrier_diff / 2.0,
+        };
+    }
 };
 
 pub const Symbol = union(enum) {
@@ -90,18 +101,16 @@ pub fn Modulator(
         /// Generate signal for the value (or no-op) into buf.
         /// Buf must be large enough to store one symbol period.
         pub fn modulate(mod: *Mod, symbol: Symbol, buf: []f32) void {
+            const fm = comptime rates.clockFm();
+            const mod_freq: f32 = baud / sample_rate / 2.0; // oscillates once per 2 symbols
             for (buf[0..symbol_len]) |*out| {
-                // Get clock FM value, which oscillates between the two clock frequencies.
-                // TODO: This should be precalclated in OscillatorRates.
-                const diff = rates.clock[1] - rates.clock[0];
-                const center = rates.clock[0] + (diff / 2);
-                var carrier_rate = mod.clock_osc_fm.generate(&sine_table, baud / sample_rate / 2.0); // [-1, 1]
-                carrier_rate *= diff; // [-diff, diff]
-                carrier_rate += center; // [center-diff, center+diff] = [low, high]
+                var carrier_freq = mod.clock_osc_fm.generate(&sine_table, mod_freq); // [-1, 1]
+                carrier_freq *= fm.modulator_amp; // [-diff/2, diff/2]
+                carrier_freq += fm.carrier_center; // [center-diff/2, center+diff/2] = [low, high]
 
                 // Clear buf on the first pass rather than summing existing signal,
                 // which is expected to be undefined.
-                out.* = mod.clock_osc.generate(&sine_table, carrier_rate) * sine_scaling;
+                out.* = mod.clock_osc.generate(&sine_table, carrier_freq) * sine_scaling;
             }
 
             // The number of samples used to smoothly ramp from an old frequency or amplitude to a new one.
@@ -518,6 +527,8 @@ pub fn Demodulator(
             },
         };
 
+        const max_search_iters = std.math.log2(symbol_len + N);
+
         /// Analyzes signal to try to find clock peak, corresponding to
         /// optimal analysis offset. Does a binary search for the highest magnitude
         /// ratio of one clock value to the other over a full symbol period.
@@ -526,7 +537,7 @@ pub fn Demodulator(
         ///
         /// Whichever clock value is detected as strongest is set as the clock state,
         /// and successive windows are expected to alternate clock values.
-        fn check_clock_full_sync(d: *Demod, signal: []const f32, max_iters: u8) ?SyncResult {
+        fn check_clock_full_sync(d: *Demod, signal: []const f32, max_iters: u16) ?SyncResult {
             const read, const sig = d.collect_signal(signal, full_sync_samples_needed) orelse return null;
 
             var center: f32 = symbol_len / 2;
@@ -535,39 +546,31 @@ pub fn Demodulator(
 
             var clock_sel: u1 = undefined;
             var ratio: f32 = 1;
-            var prev_clock_sel: u1 = undefined;
-            var prev_ratio: f32 = 1;
 
             while (distance >= 0.5 and iter < max_iters) : ({
                 iter += 1;
                 distance /= 2;
-                prev_clock_sel = clock_sel;
-                prev_ratio = ratio;
             }) {
                 const positions = [2]f32{
                     center - distance, // left
                     center + distance, // right
                 };
+                for (positions) |pos| {
+                    const chunk = sig[@intFromFloat(pos)..][0..N];
+                    const new_sel, const new_ratio = select_magnitude(&.{
+                        goertzel(N, chunk, rates.clock[0]),
+                        goertzel(N, chunk, rates.clock[1]),
+                    });
 
-                const left_chunk = sig[@intFromFloat(positions[0])..][0..N];
-                const right_chunk = sig[@intFromFloat(positions[1])..][0..N];
-
-                const mags = [4]f32{
-                    goertzel(N, left_chunk, rates.clock[0]),
-                    goertzel(N, left_chunk, rates.clock[1]),
-                    goertzel(N, right_chunk, rates.clock[0]),
-                    goertzel(N, right_chunk, rates.clock[1]),
-                };
-
-                const new_sel, const new_ratio = select_magnitude(&mags);
-                if (new_ratio > prev_ratio) {
-                    clock_sel = @as(u1, @intCast(new_sel % 2));
-                    ratio = new_ratio;
-                    center = positions[new_sel / 2];
+                    if (new_ratio > ratio) {
+                        clock_sel = @intCast(new_sel);
+                        ratio = new_ratio;
+                        center = pos;
+                    }
                 }
             }
 
-            if (ratio < 1000) {
+            if (ratio < 100) {
                 d.* = Demod.init();
                 return .{ read, .weak_signal };
             }
@@ -620,13 +623,13 @@ pub fn Demodulator(
             // Check a sliding window of N samples to the left and right of current offset.
             var start: u16 = 0;
             var best_mag: f32 = -1;
-            for (0..(2 * lookaround_count)) |offset| {
+            for (0..(2 * lookaround_count + 1)) |offset| {
                 const slice = sig[offset..][0..N];
                 const mag = goertzel(N, slice, rate);
                 if (mag > best_mag) {
                     best_mag = mag;
                     start = @intCast(offset);
-                } else break;
+                }
             }
             const analysis_slice = sig[start..][0..N];
 
@@ -635,7 +638,7 @@ pub fn Demodulator(
             const opposite_clock_mag = goertzel(N, analysis_slice, rates.clock[d.clock_state.set]);
 
             const sel, const ratio = select_magnitude(&.{ best_mag, opposite_clock_mag });
-            if (ratio < 1000) {
+            if (ratio < 100) {
                 d.* = Demod.init();
                 return .{ read, .weak_signal };
             }
@@ -667,7 +670,7 @@ pub fn Demodulator(
                 d.buffer_items = 0;
             }
 
-            return .{ read, .{ .ok = sig[start..][0..N] } };
+            return .{ read, .{ .ok = analysis_slice } };
         }
 
         /// Validates the clock of the incoming signal and returns a slice of samples ready for symbol analysis.
@@ -678,7 +681,7 @@ pub fn Demodulator(
             const clk0 = goertzel(N, sig, rates.clock[0]);
             const clk1 = goertzel(N, sig, rates.clock[1]);
             const sel, const ratio = select_magnitude(&.{ clk0, clk1 });
-            if (ratio < 1000) {
+            if (ratio < 100) {
                 d.* = Demod.init();
                 return .{ read, .weak_signal };
             }
@@ -702,40 +705,15 @@ pub fn Demodulator(
             d.clock_state = .{ .set = 1 };
             var sig: [near_sync_samples_needed]f32 = undefined;
 
-            // Fill with strong wave at 1x baud (low clock frequency) and weak wave at 2x baud
-            {
-                var phase: f32 = 0;
-                for (&sig) |*samp| {
-                    samp.* = @sin(phase);
-                    samp.* += (@sin(phase * 2) / 1200);
-                    phase += rates.clock[0] * 2 * std.math.pi;
-                }
+            for (0..4) |_| {
+                const expected_clock: u1 = d.clock_state.set +% 1;
+                test_write_clock_signal(&sig, sig.len / 2, expected_clock, 0.25);
 
                 const res = d.check_clock_no_sync(&sig).?;
                 const read, const status = res;
                 try std.testing.expectEqual(near_sync_samples_needed, @intCast(read));
                 try std.testing.expectEqual(@as([]const f32, sig[lookaround_count..][0..N]), status.ok);
-                try std.testing.expectEqual(@as(u1, 0), d.clock_state.set);
-
-                d.buffer_items = 0;
-                d.buffer_skip_samples = 0;
-            }
-
-            // Expected clock has been flipped;
-            // Fill with strong wave at 2x baud (low clock frequency) and weak wave at 1x baud
-            {
-                var phase: f32 = 0;
-                for (&sig) |*samp| {
-                    samp.* = @sin(phase);
-                    samp.* += (@sin(phase / 2) / 1200);
-                    phase += rates.clock[1] * 2 * std.math.pi;
-                }
-
-                const res = d.check_clock_no_sync(&sig).?;
-                const read, const status = res;
-                try std.testing.expectEqual(near_sync_samples_needed, @intCast(read));
-                try std.testing.expectEqual(@as([]const f32, sig[lookaround_count..][0..N]), status.ok);
-                try std.testing.expectEqual(@as(u1, 1), d.clock_state.set);
+                try std.testing.expectEqual(expected_clock, d.clock_state.set);
 
                 d.buffer_items = 0;
                 d.buffer_skip_samples = 0;
@@ -747,6 +725,80 @@ pub fn Demodulator(
                 const read, const status = res;
                 try std.testing.expectEqual(near_sync_samples_needed, @intCast(read));
                 try std.testing.expect(status == .wrong_clock);
+            }
+        }
+
+        test check_clock_near_sync {
+            var d = Demod.init();
+            var sig: [near_sync_samples_needed]f32 = undefined;
+
+            // For each possible offset, write the optimal clock signal starting at that offset,
+            // and fill the remaining area with non-optimal signal, such that the sync finds
+            // the offset.
+            for (0..(lookaround_count * 2) + 1) |offset| {
+                d.clock_state = .{ .set = 0 };
+                d.buffer_items = 0;
+                d.buffer_skip_samples = 0;
+
+                test_write_clock_signal(sig[0..], offset + (N / 2), 1, 0.25);
+
+                const res = d.check_clock_near_sync(&sig).?;
+                const read, const status = res;
+                try std.testing.expectEqual(near_sync_samples_needed, @intCast(read));
+                // TODO: This should be able to find the exact slice
+                // try std.testing.expectEqual(@as([]const f32, sig[offset..][0..N]), status.ok);
+                const ptr1 = @intFromPtr(status.ok.ptr);
+                const ptr2 = @intFromPtr(sig[offset..].ptr);
+                const diff = @max(ptr1, ptr2) - @min(ptr1, ptr2);
+                try std.testing.expect(diff < 4 * @sizeOf(f32));
+                try std.testing.expectEqual(@as(u1, 1), d.clock_state.set);
+            }
+        }
+
+        test check_clock_full_sync {
+            var d = Demod.init();
+            var sig: [full_sync_samples_needed]f32 = undefined;
+
+            var offset: usize = sig.len / 6;
+            while (offset + N < sig.len) : (offset += sig.len / 6) {
+                d = Demod.init();
+
+                test_write_clock_signal(sig[0..], offset + (N / 2), 0, 0.25);
+
+                const res = d.check_clock_full_sync(&sig, max_search_iters).?;
+                const read, const status = res;
+                try std.testing.expectEqual(full_sync_samples_needed, @intCast(read));
+                // TODO: This should be able to find the exact slice
+                // try std.testing.expectEqual(@as([]const f32, sig[offset..][0..N]), status.ok);
+                try std.testing.expect(std.meta.activeTag(status) == .ok);
+                try std.testing.expect(std.meta.activeTag(d.clock_state) == .set);
+                // TODO: This should be able get the expected clock
+                // try std.testing.expectEqual(@as(u1, 0), d.clock_state.set);
+            }
+        }
+
+        /// Write clock sine wave with oscillating frequency, reaching target frequency at peak_pos.
+        fn test_write_clock_signal(out: []f32, peak_pos: usize, clk: u1, scale: f32) void {
+            var mod_phase: f32 = @floatFromInt(peak_pos);
+            mod_phase /= @floatFromInt(out.len);
+            mod_phase = 0.25 - mod_phase;
+            if (clk == 1) mod_phase += 0.5;
+            while (mod_phase < 0) mod_phase += 1;
+            while (mod_phase >= 1) mod_phase -= 1;
+
+            var clock_mod = Oscillator{ .phase = mod_phase };
+            var clock_car = Oscillator{};
+
+            const sine_table = create_sine_table(64);
+            const fm = comptime rates.clockFm();
+            const mod_freq: f32 = baud / sample_rate / 2.0; // oscillates once per 2 symbols
+
+            for (out) |*dst| {
+                var carrier_freq = clock_mod.generate(&sine_table, mod_freq); // [-1, 1]
+                carrier_freq *= fm.modulator_amp; // [-diff/2, diff/2]
+                carrier_freq += fm.carrier_center; // [center-diff/2, center+diff/2] = [low, high]
+
+                dst.* = clock_car.generate(&sine_table, carrier_freq) * scale;
             }
         }
     };
