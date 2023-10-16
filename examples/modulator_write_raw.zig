@@ -54,10 +54,11 @@ fn write_out_samples(signal: []const f32) !void {
         try stdout.writeAll(&buf_bytes);
     }
 
-    var sig = signal;
-    while (demod.demodulate(signal)) |res| {
-        const read, const status = res;
-        sig = sig[read..];
+    var pos: usize = 0;
+    while (pos < signal.len) {
+        const read, const status = demod.demodulate(signal[pos..]) orelse break;
+        pos += read;
+        std.log.debug("demo: read {d}\tpos {d}\tstatus {}", .{ read, pos, status });
         switch (status) {
             .disconnected => {
                 try stderr.writeByte('*');
