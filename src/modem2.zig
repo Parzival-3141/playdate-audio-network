@@ -30,17 +30,6 @@ pub const OscillatorRates = extern struct {
 
         return @bitCast(rates);
     }
-
-    pub fn clockFm(rates: OscillatorRates) struct {
-        carrier_center: f32,
-        modulator_amp: f32,
-    } {
-        const carrier_diff = rates.clock[1] - rates.clock[0];
-        return .{
-            .carrier_center = rates.clock[0] + (carrier_diff / 2.0),
-            .modulator_amp = carrier_diff / 2.0,
-        };
-    }
 };
 
 pub const Symbol = union(enum) {
@@ -76,46 +65,61 @@ pub fn Modulator(
         pub const sine_scaling = 0.2;
         pub const sine_table = create_sine_table(sine_table_len);
 
+        // The number of samples used to smoothly ramp from an old frequency or amplitude to a new one.
+        // This transition helps avoid creating bursts of energy in higher frequencies (noise).
+        const transition_samples = symbol_len - N;
+
         clock_osc: Oscillator,
-        clock_osc_fm: Oscillator,
         header_osc: Oscillator,
         payload_oscs: [8]Oscillator,
+        last_clock: u1,
         last_header: u2,
         last_payload: u8,
 
         pub fn init() Mod {
             return Mod{
                 .clock_osc = .{},
-                .clock_osc_fm = .{
-                    // Initial phase is offset such that the clock freqs are strongest
-                    // at the center of the the significant N samples of the window.
-                    .phase = 1.0 - (N_float / 2.0) / symbol_len_float,
-                },
                 .header_osc = .{},
                 .payload_oscs = .{.{}} ** 8,
+                .last_clock = 0,
                 .last_header = 0,
                 .last_payload = 0,
             };
         }
 
+        fn transition_oscillator_freq(osc: *Oscillator, buf: []f32, from: f32, to: f32) void {
+            for (buf[0..], 0..) |*out, i| {
+                var frac: f32 = @floatFromInt(i);
+                frac /= @floatFromInt(buf.len);
+                const freq = cosine_interpolate(&sine_table, from, to, frac);
+                var samp = osc.generate(&sine_table, freq);
+                const amp = @abs((1.0 - frac) * 2.0 - 1.0);
+                out.* += samp * amp * sine_scaling;
+            }
+        }
+
         /// Generate signal for the value (or no-op) into buf.
         /// Buf must be large enough to store one symbol period.
         pub fn modulate(mod: *Mod, symbol: Symbol, buf: []f32) void {
-            const fm = comptime rates.clockFm();
-            const mod_freq: f32 = baud / sample_rate / 2.0; // oscillates once per 2 symbols
-            for (buf[0..symbol_len]) |*out| {
-                var carrier_freq = mod.clock_osc_fm.generate(&sine_table, mod_freq); // [-1, 1]
-                carrier_freq *= fm.modulator_amp; // [-diff/2, diff/2]
-                carrier_freq += fm.carrier_center; // [center-diff/2, center+diff/2] = [low, high]
+            @memset(buf, 0);
 
-                // Clear buf on the first pass rather than summing existing signal,
-                // which is expected to be undefined.
-                out.* = mod.clock_osc.generate(&sine_table, carrier_freq) * sine_scaling;
+            {
+                const clock = (mod.last_clock +% 1);
+                transition_oscillator_freq(
+                    &mod.clock_osc,
+                    buf[0..transition_samples],
+                    rates.clock[mod.last_clock],
+                    rates.clock[clock],
+                );
+
+                // Hold frequency for remaining samples
+                for (buf[transition_samples..][0..N]) |*out| {
+                    var samp = mod.clock_osc.generate(&sine_table, rates.clock[clock]);
+                    out.* = samp * sine_scaling;
+                }
+
+                mod.last_clock = clock;
             }
-
-            // The number of samples used to smoothly ramp from an old frequency or amplitude to a new one.
-            // This transition helps avoid creating bursts of energy in higher frequencies (noise).
-            const transition_samples = symbol_len - N;
 
             {
                 var start: u32 = 0;
@@ -123,22 +127,17 @@ pub fn Modulator(
 
                 const header = @intFromEnum(symbol);
                 if (header != mod.last_header) {
-                    // Transition from old frequency to new
-                    for (buf[0..transition_samples], 0..) |*out, i| {
-                        const frac = @as(f32, @floatFromInt(i)) / transition_samples;
-                        const freq = cosine_interpolate(
-                            &sine_table,
-                            rates.header[mod.last_header],
-                            rates.header[header],
-                            frac,
-                        );
-                        var samp = mod.header_osc.generate(&sine_table, freq);
-                        out.* += samp * sine_scaling;
-                    }
+                    transition_oscillator_freq(
+                        &mod.header_osc,
+                        buf[0..transition_samples],
+                        rates.header[mod.last_header],
+                        rates.header[header],
+                    );
 
                     start = transition_samples;
                     len = N;
                 }
+
                 // Hold frequency for remaining samples
                 for (buf[start..][0..len]) |*out| {
                     var samp = mod.header_osc.generate(&sine_table, rates.header[header]);
@@ -322,10 +321,12 @@ pub fn Demodulator(
         /// How many samples should be dropped before acquiring the next meaningful slice.
         buffer_skip_samples: u16,
 
+        const near_sync_countdown_reset = 10;
+
         pub fn init() Demod {
             return .{
                 .clock_state = .start,
-                .near_sync_countdown = 10,
+                .near_sync_countdown = near_sync_countdown_reset,
                 .buffer = undefined,
                 .buffer_items = 0,
                 .buffer_skip_samples = 0,
@@ -360,41 +361,44 @@ pub fn Demodulator(
 
             const clock_res = switch (d.clock_state) {
                 .start => res: {
-                    break :res d.check_clock_full_sync(signal, 6) orelse return null;
+                    break :res d.check_clock_full_sync(signal, max_search_iters) orelse return null;
                 },
                 .set => res: {
                     if (d.near_sync_countdown == 0) {
-                        d.near_sync_countdown = 10;
-                        break :res d.check_clock_near_sync(signal) orelse return null;
+                        const res = d.check_clock_near_sync(signal) orelse return null;
+                        d.near_sync_countdown = near_sync_countdown_reset;
+                        break :res res;
                     } else {
+                        const res = d.check_clock_no_sync(signal) orelse return null;
                         d.near_sync_countdown -= 1;
-                        break :res d.check_clock_no_sync(signal) orelse return null;
+                        break :res res;
                     }
                 },
             };
 
             const read, const status = clock_res;
+            std.log.debug("demodulate\tread {d}\tstatus {s}", .{ read, @tagName(std.meta.activeTag(status)) });
             const analysis_slice = switch (status) {
                 .weak_signal, .wrong_clock => return .{ read, .disconnected },
                 .ok => |slice| slice,
             };
 
+            var target_mag: f32 = undefined;
             {
                 const hdr0 = goertzel(N, analysis_slice, rates.header[0]);
                 const hdr1 = goertzel(N, analysis_slice, rates.header[1]);
                 const hdr2 = goertzel(N, analysis_slice, rates.header[2]);
                 const sel, const ratio = select_magnitude(&.{ hdr0, hdr1, hdr2 });
-                if (ratio < 1000) {
+                std.log.debug("header:\thdr0 {d}\thdr1 {d}\thdr2 {d}\tsel {d}\tratio {d}", .{ hdr0, hdr1, hdr2, sel, ratio });
+                if (ratio < 100) {
                     d.* = init();
                     return .{ read, .disconnected };
                 }
 
-                std.log.debug("hdr:  {d} | {d} | {d}", .{ hdr0, hdr1, hdr2 });
-
                 switch (@as(u2, @intCast(sel))) {
                     0 => return .{ read, .{ .symbol = .waiting } },
                     1 => return .{ read, .{ .symbol = .ready } },
-                    2 => {}, // below
+                    2 => target_mag = hdr2 / 10.0,
                     3 => unreachable,
                 }
             }
@@ -402,8 +406,7 @@ pub fn Demodulator(
             var byte: u8 = 0;
             for (rates.payload, 0..) |rate, bit| {
                 const mag = goertzel(N, analysis_slice, rate);
-                const target_mag = 2.0; // TODO
-                const val: u8 = @intFromBool(mag > target_mag); // TODO
+                const val: u8 = @intFromBool(mag > target_mag);
                 const mask: u8 = val << @intCast(bit);
                 byte |= mask;
 
@@ -435,14 +438,14 @@ pub fn Demodulator(
             // Otherwise, either the signal slice is too short or we need to append to
             // an in-progress buffering.
             const copy_count: u16 = @intCast(needed - d.buffer_items);
-            if (copy_count < sig.len) {
-                @memcpy(d.buffer[d.buffer_items..][0..copy_count], sig[0..copy_count]);
-                d.buffer_items += copy_count;
-                return .{ copy_count, d.buffer[0..needed] };
-            } else {
+            if (copy_count > sig.len) {
                 @memcpy(d.buffer[d.buffer_items..][0..sig.len], sig);
                 d.buffer_items += @intCast(sig.len);
                 return null;
+            } else {
+                @memcpy(d.buffer[d.buffer_items..][0..copy_count], sig[0..copy_count]);
+                d.buffer_items += copy_count;
+                return .{ copy_count, d.buffer[0..needed] };
             }
         }
 
@@ -527,7 +530,7 @@ pub fn Demodulator(
             },
         };
 
-        const max_search_iters = std.math.log2(symbol_len + N);
+        const max_search_iters = std.math.log2(full_sync_samples_needed);
 
         /// Analyzes signal to try to find clock peak, corresponding to
         /// optimal analysis offset. Does a binary search for the highest magnitude
@@ -538,10 +541,12 @@ pub fn Demodulator(
         /// Whichever clock value is detected as strongest is set as the clock state,
         /// and successive windows are expected to alternate clock values.
         fn check_clock_full_sync(d: *Demod, signal: []const f32, max_iters: u16) ?SyncResult {
+            std.log.debug("full sync...", .{});
             const read, const sig = d.collect_signal(signal, full_sync_samples_needed) orelse return null;
 
-            var center: f32 = symbol_len / 2;
-            var distance: f32 = symbol_len / 4;
+            var center: f32 = symbol_len_float / 2.0;
+            var distance: f32 = symbol_len_float / 4.0;
+            var start: usize = 0;
             var iter: u16 = 0;
 
             var clock_sel: u1 = undefined;
@@ -555,20 +560,25 @@ pub fn Demodulator(
                     center - distance, // left
                     center + distance, // right
                 };
-                for (positions) |pos| {
-                    const chunk = sig[@intFromFloat(pos)..][0..N];
-                    const new_sel, const new_ratio = select_magnitude(&.{
+                for (positions) |pos_float| {
+                    const pos: usize = @intFromFloat(pos_float + 0.5);
+                    const chunk = sig[pos..][0..N];
+                    const mags = [2]f32{
                         goertzel(N, chunk, rates.clock[0]),
                         goertzel(N, chunk, rates.clock[1]),
-                    });
+                    };
+                    const new_sel, const new_ratio = select_magnitude(&mags);
+                    std.log.debug("full sync: center {d}\tdistance ±{d}\tpos {d}\t{d}\t{d}\tsel {d}\tratio {d}", .{ center, distance, pos, mags[0], mags[1], new_sel, new_ratio });
 
                     if (new_ratio > ratio) {
                         clock_sel = @intCast(new_sel);
                         ratio = new_ratio;
-                        center = pos;
+                        center = pos_float;
+                        start = pos;
                     }
                 }
             }
+            std.log.debug("result:    start {d}\tsel {d}\tratio {d}", .{ start, clock_sel, ratio });
 
             if (ratio < 100) {
                 d.* = Demod.init();
@@ -576,33 +586,23 @@ pub fn Demodulator(
             }
             d.clock_state = .{ .set = clock_sel };
 
-            // Resolved analysis window.
-            const start: usize = @intFromFloat(center);
-            const slice = sig[start..][0..N];
-
             // TODO: It should be possible to "unread" by as much as lookaround_count
             // to avoid copying into the buffer so successive calls can always avoid
             // relying on the buffer when incoming signal is long enough.
             // As is, the buffer is always used.
-
-            // The position of the next meaningful symbol portion, minus look-behind.
-            const next_needed_sample_pos = start + symbol_len - lookaround_count;
-            if (next_needed_sample_pos < d.buffer_items) {
-                // Some of what we need for the next analysis (look-behind, N, look-ahead)
-                // is already in the current slice. Move as many as possible to the start
-                // of the buffer for the next run.
-                const to_move = sig[next_needed_sample_pos..];
-                for (to_move, d.buffer[0..to_move.len]) |src, *dst| {
-                    dst.* = src;
+            const next_start = start + N + padding_count - lookaround_count;
+            if (next_start < sig.len) {
+                const save = sig.len - next_start;
+                for (sig[next_start..][0..save], d.buffer[0..save]) |from, *to| {
+                    to.* = from;
                 }
-                d.buffer_skip_samples = 0;
-                d.buffer_items = @intCast(to_move.len);
+                d.buffer_items = @intCast(save);
             } else {
-                d.buffer_skip_samples = @intCast(next_needed_sample_pos - d.buffer_items);
+                d.buffer_skip_samples = @intCast(next_start - sig.len);
                 d.buffer_items = 0;
             }
 
-            return .{ read, .{ .ok = slice } };
+            return .{ read, .{ .ok = sig[start..][0..N] } };
         }
 
         /// Analyzes signal to find clock peak and returns a slice of samples ready for symbol analysis.
@@ -615,72 +615,72 @@ pub fn Demodulator(
         /// - Expects the clock value to oscillate correctly. Full sync just picks whichever
         ///   is strongest as the starting value.
         fn check_clock_near_sync(d: *Demod, signal: []const f32) ?SyncResult {
+            std.log.debug("near sync...", .{});
+
             const read, const sig = d.collect_signal(signal, near_sync_samples_needed) orelse return null;
 
-            const new_clock = d.clock_state.set +% 1;
-            const rate = rates.clock[new_clock];
-
             // Check a sliding window of N samples to the left and right of current offset.
-            var start: u16 = 0;
-            var best_mag: f32 = -1;
+            var start: usize = 0;
+            // var best_mag: f32 = -1;
+            var ratio: f32 = 1;
+            var sel: u1 = 0;
             for (0..(2 * lookaround_count + 1)) |offset| {
                 const slice = sig[offset..][0..N];
-                const mag = goertzel(N, slice, rate);
-                if (mag > best_mag) {
-                    best_mag = mag;
-                    start = @intCast(offset);
+
+                const mags = [2]f32{
+                    goertzel(N, slice, rates.clock[0]),
+                    goertzel(N, slice, rates.clock[1]),
+                };
+                const new_sel, const new_ratio = select_magnitude(&mags);
+                std.log.debug("near sync: offset {d}\tmag0 {d}\tmag1 {d}\tsel {d}\tratio {d}\tbest ratio {d}", .{ offset, mags[0], mags[1], new_sel, new_ratio, ratio });
+
+                if (new_ratio > ratio) {
+                    ratio = new_ratio;
+                    sel = @intCast(new_sel);
+                    start = offset;
                 }
             }
-            const analysis_slice = sig[start..][0..N];
+            std.log.debug("result:    start {d}", .{start});
 
-            // Compare to opposite clock frequency strength to ensure the remote clock
-            // is still oscillating correctly.
-            const opposite_clock_mag = goertzel(N, analysis_slice, rates.clock[d.clock_state.set]);
-
-            const sel, const ratio = select_magnitude(&.{ best_mag, opposite_clock_mag });
             if (ratio < 100) {
                 d.* = Demod.init();
                 return .{ read, .weak_signal };
             }
-            if (sel != 0) {
+            if (sel == d.clock_state.set) {
                 d.* = Demod.init();
                 return .{ read, .wrong_clock };
             }
-            d.clock_state = .{ .set = new_clock };
+            d.clock_state = .{ .set = sel };
 
             // TODO: It should be possible to "unread" by as much as lookaround_count
             // to avoid copying into the buffer so successive calls can always avoid
             // relying on the buffer when incoming signal is long enough.
             // As is, the buffer is always used.
-
-            // The position of the next meaningful symbol portion, minus look-behind.
-            const next_needed_sample_pos = start + symbol_len - lookaround_count;
-            if (next_needed_sample_pos < d.buffer_items) {
-                // Some of what we need for the next analysis (look-behind, N, look-ahead)
-                // is already in the current slice. Move as many as possible to the start
-                // of the buffer for the next run.
-                const to_move = sig[next_needed_sample_pos..];
-                for (to_move, d.buffer[0..to_move.len]) |src, *dst| {
-                    dst.* = src;
+            const next_start = start + N + padding_count - lookaround_count;
+            if (next_start < sig.len) {
+                const save = sig.len - next_start;
+                for (sig[next_start..][0..save], d.buffer[0..save]) |from, *to| {
+                    to.* = from;
                 }
-                d.buffer_skip_samples = 0;
-                d.buffer_items = @intCast(to_move.len);
+                d.buffer_items = @intCast(save);
             } else {
-                d.buffer_skip_samples = next_needed_sample_pos - d.buffer_items;
+                d.buffer_skip_samples = @intCast(next_start - sig.len);
                 d.buffer_items = 0;
             }
 
-            return .{ read, .{ .ok = analysis_slice } };
+            return .{ read, .{ .ok = sig[start..][0..N] } };
         }
 
         /// Validates the clock of the incoming signal and returns a slice of samples ready for symbol analysis.
         fn check_clock_no_sync(d: *Demod, signal: []const f32) ?SyncResult {
-            const read, var sig = d.collect_signal(signal, near_sync_samples_needed) orelse return null;
-            sig = sig[lookaround_count..][0..N];
+            std.log.debug("no sync...", .{});
+            const read, const sig = d.collect_signal(signal, near_sync_samples_needed) orelse return null;
+            const start = lookaround_count;
 
-            const clk0 = goertzel(N, sig, rates.clock[0]);
-            const clk1 = goertzel(N, sig, rates.clock[1]);
+            const clk0 = goertzel(N, sig[start..][0..N], rates.clock[0]);
+            const clk1 = goertzel(N, sig[start..][0..N], rates.clock[1]);
             const sel, const ratio = select_magnitude(&.{ clk0, clk1 });
+            std.log.debug("no sync\tclk0 {d}\tclk1 {d}\tsel {d}\tratio {d}", .{ clk0, clk1, sel, ratio });
             if (ratio < 100) {
                 d.* = Demod.init();
                 return .{ read, .weak_signal };
@@ -691,13 +691,23 @@ pub fn Demodulator(
             }
             d.clock_state = .{ .set = @intCast(sel) };
 
-            const next_needed_sample_pos = symbol_len - lookaround_count;
-            // TODO: ensure this is always true by requiring (2*lookaround) < padding
-            std.debug.assert(next_needed_sample_pos >= d.buffer_items);
-            d.buffer_skip_samples = next_needed_sample_pos - d.buffer_items;
-            d.buffer_items = 0;
+            // TODO: It should be possible to "unread" by as much as lookaround_count
+            // to avoid copying into the buffer so successive calls can always avoid
+            // relying on the buffer when incoming signal is long enough.
+            // As is, the buffer is always used.
+            const next_start = start + N + padding_count - lookaround_count;
+            if (next_start < sig.len) {
+                const save = sig.len - next_start;
+                for (sig[next_start..][0..save], d.buffer[0..save]) |from, *to| {
+                    to.* = from;
+                }
+                d.buffer_items = @intCast(save);
+            } else {
+                d.buffer_skip_samples = @intCast(next_start - sig.len);
+                d.buffer_items = 0;
+            }
 
-            return .{ read, .{ .ok = sig } };
+            return .{ read, .{ .ok = sig[start..][0..N] } };
         }
 
         test check_clock_no_sync {
