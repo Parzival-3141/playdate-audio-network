@@ -6,7 +6,17 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const sample_rate = b.option(f64, "sample-rate", "Audio sample rate; device must support this when using real-time audio (default 44100)") orelse 44_100.0;
+    const N = b.option(u16, "N", "Determines modem oscillator and analysis frequencies (default 26)") orelse 26;
+    const baud = b.option(f64, "baud", "Modem symbol rate (default 441)") orelse 441;
     const sdk_path = b.option([]const u8, "playdate-sdk-path", "Path to installed Playdate SDK");
+
+    const log_level = b.option(std.log.Level, "log-level", "Log verbosity threshold") orelse .info;
+    const options = b.addOptions();
+    options.addOption(std.log.Level, "log_level", log_level);
+    options.addOption(f64, "sample_rate", sample_rate);
+    options.addOption(u16, "N", N);
+    options.addOption(f64, "baud", baud);
 
     const playdate_mod = b.createModule(.{ .source_file = .{ .path = "src/playdate.zig" } });
     const modem_mod = b.addModule("modem", .{ .source_file = .{ .path = "src/modem.zig" } });
@@ -24,12 +34,9 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "modem", .module = modem_mod },
             .{ .name = "playdate", .module = playdate_mod },
         },
+        .options = options,
     });
     try addPlaydateSimulatorRun(b, "example-playdate-send", example_send_game, sdk_path);
-
-    const log_level = b.option(std.log.Level, "log-level", "Log verbosity threshold") orelse .info;
-    const options = b.addOptions();
-    options.addOption(std.log.Level, "log_level", log_level);
 
     const pc_examples = .{
         .{ .name = "demodulator-dump", .src = "demodulator_dump.zig", .pa = true },
@@ -83,6 +90,7 @@ const PlaydateGameExeOptions = struct {
     optimize: std.builtin.OptimizeMode,
     assets_dir: ?[]const u8 = null,
     modules: []const std.Build.ModuleDependency,
+    options: *std.Build.Step.Options,
 };
 
 const PlaydateGameExe = struct {
@@ -105,6 +113,7 @@ fn addPlaydateGameExe(
         .optimize = opts.optimize,
         .target = .{},
     });
+    lib.addOptions("options", opts.options);
     for (opts.modules) |mod| {
         lib.addModule(mod.name, mod.module);
     }
@@ -121,6 +130,7 @@ fn addPlaydateGameExe(
         .target = playdate_target,
         .optimize = opts.optimize,
     });
+    exe.addOptions("options", opts.options);
     for (opts.modules) |mod| {
         exe.addModule(mod.name, mod.module);
     }
