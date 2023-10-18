@@ -1,6 +1,7 @@
 const std = @import("std");
 const pdapi = @import("playdate");
 const modem = @import("modem").modem2;
+const options = @import("options");
 
 var g_playdate_image: *pdapi.LCDBitmap = undefined;
 var playdate: *pdapi.PlaydateAPI = undefined;
@@ -44,6 +45,7 @@ fn menu_item(_: ?*anyopaque) callconv(.C) void {
 }
 
 var sound_toggle = false;
+var send_data = false;
 var phase: f32 = 0;
 var frequency: f32 = 110;
 var dc_amp: i16 = 0;
@@ -122,6 +124,7 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     if (pushed.up and sequence_periods_index < sequence_periods.len - 1) sequence_periods_index += 1;
     if (pushed.down and sequence_periods_index > 0) sequence_periods_index -= 1;
 
+    if (pushed.a) send_data = !send_data;
     if (pushed.b) sound_toggle = !sound_toggle;
 
     if (playdate.system.isCrankDocked() == 0) {
@@ -186,7 +189,7 @@ fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     }
 }
 
-const Modulator = modem.Modulator(31, 44_100, 882, 64);
+const Modulator = modem.Modulator(options.N, options.sample_rate, options.baud, 64);
 var modulator = Modulator.init();
 var modulator_sample_count: u16 = 0;
 const modulator_data: []const u8 =
@@ -211,9 +214,11 @@ fn generate_modulated_data(left: [*]i16, right: [*]i16, count: u32) callconv(.C)
         dead.* = 0;
 
         if (!next_symbol_ready) {
-            var symbol: modem.Symbol = undefined;
-            symbol = .{ .payload = modulator_data[modulator_data_index] };
-            modulator_data_index = @intCast((modulator_data_index + 1) % modulator_data.len);
+            const symbol: modem.Symbol = if (send_data) blk: {
+                const sym = .{ .payload = modulator_data[modulator_data_index] };
+                modulator_data_index = @intCast((modulator_data_index + 1) % modulator_data.len);
+                break :blk sym;
+            } else .ready;
 
             modulator.modulate(symbol, &next_symbol_signal_buf);
             next_symbol_ready = true;

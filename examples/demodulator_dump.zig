@@ -17,7 +17,6 @@ pub const std_options = struct {
 const modem = @import("modem").modem2;
 
 var stream: ?*c.PaStream = null;
-const sample_rate: f32 = 44_100;
 
 pub fn main() !void {
     paAssert(c.Pa_Initialize());
@@ -41,7 +40,7 @@ pub fn main() !void {
         &stream,
         &in_params,
         null,
-        sample_rate,
+        options.sample_rate,
         c.paFramesPerBufferUnspecified,
         c.paNoFlag,
         paCallback,
@@ -122,7 +121,7 @@ fn dump_bitstream() void {
     }
 }
 
-const Demodulator = modem.Demodulator(31, 44_100, 882);
+const Demodulator = modem.Demodulator(options.N, options.sample_rate, options.baud);
 var demodulator = Demodulator.init();
 
 var demodulated_data_ring_buf: [1024]u8 = undefined;
@@ -143,11 +142,12 @@ fn paCallback(
     _ = time_info;
 
     const ins: [*]const [*]const f32 = if (in_buf) |buf| @alignCast(@ptrCast(buf)) else unreachable;
+    const sig = ins[0][0..frame_count];
 
-    var sig = ins[0][0..frame_count];
-    while (demodulator.demodulate(sig)) |res| {
-        const read, const status = res;
-        sig = sig[read..];
+    var pos: usize = 0;
+    while (pos < sig.len) {
+        const read, const status = demodulator.demodulate(sig[pos..]) orelse break;
+        pos += read;
         switch (status) {
             .disconnected => produce_data('*'),
             .symbol => |sym| switch (sym) {

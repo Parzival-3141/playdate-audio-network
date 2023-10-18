@@ -10,11 +10,11 @@ pub const std_options = struct {
     };
 };
 
-const modem = @import("modem").modem2;
+const sample_rate = options.sample_rate;
+const N = options.N;
+const baud = options.baud;
 
-const sample_rate: f32 = 44_100;
-const N = 31;
-const baud = 882;
+const modem = @import("modem").modem2;
 
 const Modulator = modem.Modulator(N, sample_rate, baud, 64);
 const Demodulator = modem.Demodulator(N, sample_rate, baud);
@@ -46,7 +46,6 @@ pub fn main() !void {
 var disconnects: usize = 0;
 
 fn write_out_samples(signal: []const f32) !void {
-    const stderr = std.io.getStdErr().writer();
     const stdout = std.io.getStdOut().writer();
 
     for (signal) |float| {
@@ -56,17 +55,21 @@ fn write_out_samples(signal: []const f32) !void {
 
     var pos: usize = 0;
     while (pos < signal.len) {
-        const read, const status = demod.demodulate(signal[pos..]) orelse break;
+        const read, const status = demod.demodulate(signal[pos..]) orelse {
+            std.log.debug("demo: read {d} (need more)", .{signal[pos..].len});
+            break;
+        };
         pos += read;
-        std.log.debug("demo: read {d}\tpos {d}\tstatus {}", .{ read, pos, status });
+        std.log.debug("demo: read {d}\tpos {d}", .{ read, pos });
         switch (status) {
             .disconnected => {
-                try stderr.writeByte('*');
+                std.log.info("DISCONNECTED", .{});
                 disconnects += 1;
             },
             .symbol => |symbol| switch (symbol) {
-                .waiting, .ready => {},
-                .payload => |byte| try stderr.writeByte(byte),
+                .waiting => std.log.info("WAITING", .{}),
+                .ready => std.log.info("READY", .{}),
+                .payload => |byte| std.log.info("BYTE: {c}", .{byte}),
             },
         }
     }
