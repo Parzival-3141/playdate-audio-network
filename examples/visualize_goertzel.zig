@@ -4,10 +4,10 @@ const c = @cImport({
     @cInclude("portaudio.h");
 });
 
-const demodulator = @import("modem").demodulator;
+const options = @import("options");
+const goertzel = @import("modem").goertzel;
 
 var stream: ?*c.PaStream = null;
-const sample_rate: f32 = 44_100;
 
 pub fn main() !void {
     paAssert(c.Pa_Initialize());
@@ -30,7 +30,7 @@ pub fn main() !void {
         &stream,
         &in_params,
         null,
-        sample_rate,
+        options.sample_rate,
         c.paFramesPerBufferUnspecified,
         c.paNoFlag,
         paCallback,
@@ -68,19 +68,23 @@ fn visualize_goertzel() void {
     }
 }
 
-const goertzel_N = 18;
-const goertzel_analyze_period = goertzel_N;
 const goertzel_detect_frequencies = blk: {
-    comptime var freqs: []const f32 = &[0]f32{};
-    const base_freq = sample_rate / @as(f32, goertzel_N);
-    var f = base_freq;
-    while (f < 20_000) : (f += base_freq) {
-        freqs = freqs ++ &[1]f32{f};
+    const base_freq: f32 = @floatCast(options.sample_rate / @as(f32, options.N));
+
+    comptime var count: usize = 0;
+    while (base_freq * @as(f32, @floatFromInt(count + 1)) < 20_000) {
+        count += 1;
     }
+
+    var freqs: [count]f32 = undefined;
+    for (&freqs, 0..) |*freq, i| {
+        freq.* = base_freq * @as(f32, @floatFromInt(i + 1));
+    }
+
     break :blk freqs;
 };
 var sample_counter: u32 = 0;
-var goertzel_buffer: [goertzel_analyze_period]f32 = undefined;
+var goertzel_buffer: [options.N]f32 = undefined;
 var goertzel_powers = [1]f32{0} ** goertzel_detect_frequencies.len;
 var goertzel_strongest_freq_index: usize = 0;
 
@@ -112,15 +116,15 @@ fn goertzel_analyze_stream(in_samp: f32) void {
     if (sample_counter == goertzel_buffer.len) {
         sample_counter = 0;
 
-        goertzel_powers[0] = demodulator.goertzel(
+        goertzel_powers[0] = goertzel(
+            options.N,
             goertzel_buffer[0..],
-            goertzel_detect_frequencies[0] / @as(f32, sample_rate),
-            goertzel_N,
+            goertzel_detect_frequencies[0] / @as(f32, options.sample_rate),
         );
         goertzel_strongest_freq_index = 0;
 
         for (goertzel_detect_frequencies[1..], goertzel_powers[1..], 1..) |freq, *pow, j| {
-            pow.* = demodulator.goertzel(goertzel_buffer[0..], freq / @as(f32, sample_rate), goertzel_N);
+            pow.* = goertzel(options.N, goertzel_buffer[0..], freq / @as(f32, options.sample_rate));
             // NOTE: this can be calculated outside of audio callback,
             // but requires reading all powers atomically
             if (pow.* > goertzel_powers[j - 1]) {

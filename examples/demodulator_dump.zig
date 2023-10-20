@@ -14,7 +14,7 @@ pub const std_options = struct {
     };
 };
 
-const modem = @import("modem").modem2;
+const modem = @import("modem");
 
 var stream: ?*c.PaStream = null;
 

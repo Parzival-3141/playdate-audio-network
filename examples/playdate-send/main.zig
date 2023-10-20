@@ -1,6 +1,6 @@
 const std = @import("std");
 const pdapi = @import("playdate");
-const modem = @import("modem").modem2;
+const modem = @import("modem");
 const options = @import("options");
 
 var g_playdate_image: *pdapi.LCDBitmap = undefined;
