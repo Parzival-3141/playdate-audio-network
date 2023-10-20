@@ -200,78 +200,6 @@ pub fn Demodulator(
             }
         }
 
-        test collect_signal {
-            var d = Demod.init();
-            const static_signal: [full_sync_samples_needed]f32 = undefined;
-
-            const Step = struct {
-                skip: ?u16 = null,
-                sig: []const f32,
-                needed: u16,
-                res: ?struct { usize, []const f32 },
-                buffer_items: u16,
-                reset: bool = false,
-            };
-            const steps: []const Step = &.{
-                .{
-                    .sig = &static_signal,
-                    .needed = 0,
-                    .res = .{ 0, static_signal[0..0] },
-                    .buffer_items = 0,
-                },
-                .{
-                    .sig = &static_signal,
-                    .needed = 1,
-                    .res = .{ 1, static_signal[0..1] },
-                    .buffer_items = 0,
-                },
-                .{
-                    .sig = static_signal[0..symbol_len],
-                    .needed = symbol_len,
-                    .res = .{ symbol_len, static_signal[0..symbol_len] },
-                    .buffer_items = 0,
-                },
-                .{
-                    .sig = static_signal[0..symbol_len],
-                    .needed = symbol_len + 1,
-                    .res = null,
-                    .buffer_items = symbol_len,
-                },
-                .{
-                    .sig = static_signal[0..symbol_len],
-                    .needed = symbol_len + 1,
-                    .res = .{ 1, d.buffer[0 .. symbol_len + 1] },
-                    .buffer_items = symbol_len + 1,
-                },
-                .{ // part 1
-                    .reset = true,
-                    .skip = full_sync_samples_needed / 2,
-                    .sig = &static_signal,
-                    .needed = full_sync_samples_needed,
-                    .res = null,
-                    .buffer_items = static_signal.len - (full_sync_samples_needed / 2),
-                },
-                .{ // part 2
-                    .sig = &static_signal,
-                    .needed = full_sync_samples_needed,
-                    .res = .{ full_sync_samples_needed / 2, d.buffer[0..full_sync_samples_needed] },
-                    .buffer_items = full_sync_samples_needed,
-                },
-            };
-
-            for (steps) |step| {
-                if (step.reset) {
-                    d.buffer_items = 0;
-                }
-                if (step.skip) |amount| {
-                    d.buffer_skip_samples = amount;
-                }
-                const res = d.collect_signal(step.sig, step.needed);
-                try std.testing.expectEqual(step.res, res);
-                try std.testing.expectEqual(step.buffer_items, d.buffer_items);
-            }
-        }
-
         fn buffer_finish(d: *Demod, sig: []const f32, next_start: u16) void {
             assert(d.buffer_skip_samples == 0);
 
@@ -285,6 +213,75 @@ pub fn Demodulator(
                 d.buffer_skip_samples = @intCast(next_start - sig.len);
                 d.buffer_items = 0;
             }
+        }
+
+        test collect_signal {
+            var d = Demod.init();
+            const static_signal: [full_sync_samples_needed]f32 = undefined;
+
+            try test_collect_signal(&d, .{
+                .sig = &static_signal,
+                .needed = 0,
+                .res = .{ 0, static_signal[0..0] },
+                .buffer_items = 0,
+            });
+            try test_collect_signal(&d, .{
+                .sig = &static_signal,
+                .needed = 1,
+                .res = .{ 1, static_signal[0..1] },
+                .buffer_items = 0,
+            });
+            try test_collect_signal(&d, .{
+                .sig = static_signal[0..symbol_len],
+                .needed = symbol_len,
+                .res = .{ symbol_len, static_signal[0..symbol_len] },
+                .buffer_items = 0,
+            });
+            try test_collect_signal(&d, .{
+                .sig = static_signal[0..symbol_len],
+                .needed = symbol_len + 1,
+                .res = null,
+                .buffer_items = symbol_len,
+            });
+            try test_collect_signal(&d, .{
+                .sig = static_signal[0..symbol_len],
+                .needed = symbol_len + 1,
+                .res = .{ 1, d.buffer[0 .. symbol_len + 1] },
+                .buffer_items = symbol_len + 1,
+            });
+            try test_collect_signal(&d, .{ // part 1
+                .reset = true,
+                .skip = full_sync_samples_needed / 2,
+                .sig = &static_signal,
+                .needed = full_sync_samples_needed,
+                .res = null,
+                .buffer_items = static_signal.len - (full_sync_samples_needed / 2),
+            });
+            try test_collect_signal(&d, .{ // part 2
+                .sig = &static_signal,
+                .needed = full_sync_samples_needed,
+                .res = .{ full_sync_samples_needed / 2, d.buffer[0..full_sync_samples_needed] },
+                .buffer_items = full_sync_samples_needed,
+            });
+        }
+
+        fn test_collect_signal(d: *Demod, step: struct {
+            skip: ?u16 = null,
+            sig: []const f32,
+            needed: u16,
+            res: ?struct { usize, []const f32 },
+            buffer_items: u16,
+            reset: bool = false,
+        }) !void {
+            if (step.reset) {
+                d.buffer_items = 0;
+            }
+            if (step.skip) |amount| {
+                d.buffer_skip_samples = amount;
+            }
+            const res = d.collect_signal(step.sig, step.needed);
+            try std.testing.expectEqual(step.res, res);
+            try std.testing.expectEqual(step.buffer_items, d.buffer_items);
         }
     };
 }
