@@ -1,5 +1,5 @@
-pub const Modulator = @import("modulator.zig").Modulator;
-pub const Demodulator = @import("demodulator.zig").Demodulator;
+pub const modulator = @import("modulator.zig");
+pub const demodulator = @import("demodulator.zig");
 pub const goertzel = @import("goertzel.zig").goertzel;
 pub const Oscillator = @import("Oscillator.zig");
 
@@ -46,14 +46,14 @@ pub const OscillatorRates = extern struct {
 };
 
 test "modulate and demodulate symbols" {
-    try test_modulate_and_demodulate(26, 1_000, 10);
-    try test_modulate_and_demodulate(26, 44_100, 100);
-    try test_modulate_and_demodulate(26, 44_100, 441);
-    try test_modulate_and_demodulate(30, 48_000, 500);
-    try test_modulate_and_demodulate(40, 10_000, 50);
-    try test_modulate_and_demodulate(40, 14_000, 160);
-    try test_modulate_and_demodulate(60, 48_000, 10);
-    try test_modulate_and_demodulate(60, 48_000, 50);
+    try test_modulate_and_demodulate(26, 1_000, 10, .{}, .{});
+    try test_modulate_and_demodulate(26, 44_100, 100, .{}, .{});
+    try test_modulate_and_demodulate(26, 44_100, 441, .{}, .{});
+    try test_modulate_and_demodulate(30, 48_000, 500, .{}, .{});
+    try test_modulate_and_demodulate(40, 10_000, 50, .{}, .{});
+    try test_modulate_and_demodulate(40, 14_000, 160, .{}, .{});
+    try test_modulate_and_demodulate(60, 48_000, 10, .{}, .{});
+    try test_modulate_and_demodulate(60, 48_000, 50, .{}, .{});
 }
 
 const std = @import("std");
@@ -62,9 +62,11 @@ fn test_modulate_and_demodulate(
     comptime N: u16,
     comptime sample_rate: comptime_float,
     comptime baud: comptime_float,
+    comptime mod_opts: modulator.Options,
+    comptime demod_opts: demodulator.Options,
 ) !void {
-    const Mod = Modulator(N, sample_rate, baud, 64);
-    const Demod = Demodulator(N, sample_rate, baud);
+    const Mod = modulator.Modulator(N, sample_rate, baud, mod_opts);
+    const Demod = demodulator.Demodulator(N, sample_rate, baud, demod_opts);
 
     var mod = Mod.init();
     var demod = Demod.init();

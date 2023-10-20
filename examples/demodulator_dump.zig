@@ -14,7 +14,7 @@ pub const std_options = struct {
     };
 };
 
-const modem = @import("modem");
+const demodulator = @import("modem").demodulator;
 
 var stream: ?*c.PaStream = null;
 
@@ -121,8 +121,8 @@ fn dump_bitstream() void {
     }
 }
 
-const Demodulator = modem.Demodulator(options.N, options.sample_rate, options.baud);
-var demodulator = Demodulator.init();
+const Demodulator = demodulator.Demodulator(options.N, options.sample_rate, options.baud, .{});
+var demod = Demodulator.init();
 
 var demodulated_data_ring_buf: [1024]u8 = undefined;
 var demodulated_data_write_pos: u16 = 0;
@@ -146,7 +146,7 @@ fn paCallback(
 
     var pos: usize = 0;
     while (pos < sig.len) {
-        const read, const status = demodulator.demodulate(sig[pos..]) orelse break;
+        const read, const status = demod.demodulate(sig[pos..]) orelse break;
         pos += read;
         switch (status) {
             .disconnected => produce_data('*'),

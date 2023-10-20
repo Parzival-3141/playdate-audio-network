@@ -6,10 +6,21 @@ const OscillatorRates = modem.OscillatorRates;
 const Symbol = modem.Symbol;
 const goertzel = modem.goertzel;
 
+pub const Options = struct {
+    /// After completing this many successful symbol demodulations,
+    /// issue a search in the nearby surrounding area of the current focus window
+    /// to compensate for drift, i.e. the server is slightly slower or faster than the client.
+    /// This is likely to happen when the two sides have different hardware clock speeds.
+    near_sync_interval: u16 = 6,
+    /// The number of samples behind and ahead of the focus area to include in a near sync.
+    lookaround_count: u16 = 2,
+};
+
 pub fn Demodulator(
     comptime N: u16,
     comptime sample_rate: comptime_float,
     comptime baud: comptime_float,
+    comptime opts: Options,
 ) type {
     comptime {
         assert(N > 0);
@@ -31,15 +42,12 @@ pub fn Demodulator(
             }
         }
 
-        const lookaround_count = 2;
-        const near_sync_samples_needed = N + (2 * lookaround_count);
+        const near_sync_samples_needed = N + (2 * opts.lookaround_count);
         const full_sync_samples_needed = symbol_len + N;
         comptime {
-            assert(lookaround_count < N);
+            assert(opts.lookaround_count < N);
             assert(near_sync_samples_needed < symbol_len);
         }
-
-        const near_sync_countdown_reset = 6;
 
         pub const SyncState = union(enum) {
             start,
@@ -91,13 +99,13 @@ pub fn Demodulator(
             const read, const analysis_slice = switch (d.sync_state) {
                 .start => res: {
                     const res = d.get_slice_full_sync(signal) orelse return null;
-                    d.sync_state = .{ .near_sync_countdown = near_sync_countdown_reset };
+                    d.sync_state = .{ .near_sync_countdown = opts.near_sync_interval };
                     break :res res;
                 },
                 .near_sync_countdown => |count| res: {
                     if (count == 0) {
                         const res = d.get_slice_near_sync(signal) orelse return null;
-                        d.sync_state.near_sync_countdown = near_sync_countdown_reset;
+                        d.sync_state.near_sync_countdown = opts.near_sync_interval;
                         break :res res;
                     } else {
                         const res = d.get_slice_no_sync(signal) orelse return null;
@@ -145,7 +153,7 @@ pub fn Demodulator(
         fn get_slice_full_sync(d: *Demod, signal: []const f32) ?SyncResult {
             const read, const sig = d.collect_signal(signal, full_sync_samples_needed) orelse return null;
             const start = get_best_power(sig, N, N / 3); // TODO: consider using binary search
-            d.buffer_finish(sig, start + symbol_len - lookaround_count);
+            d.buffer_finish(sig, start + symbol_len - opts.lookaround_count);
 
             return .{ read, sig[start..][0..N] };
         }
@@ -153,15 +161,15 @@ pub fn Demodulator(
         fn get_slice_near_sync(d: *Demod, signal: []const f32) ?SyncResult {
             const read, const sig = d.collect_signal(signal, near_sync_samples_needed) orelse return null;
             const start = get_best_power(sig, N, 1);
-            d.buffer_finish(sig, start + symbol_len - lookaround_count);
+            d.buffer_finish(sig, start + symbol_len - opts.lookaround_count);
 
             return .{ read, sig[start..][0..N] };
         }
 
         fn get_slice_no_sync(d: *Demod, signal: []const f32) ?SyncResult {
             const read, const sig = d.collect_signal(signal, near_sync_samples_needed) orelse return null;
-            const start = lookaround_count;
-            d.buffer_finish(sig, start + symbol_len - lookaround_count);
+            const start = opts.lookaround_count;
+            d.buffer_finish(sig, start + symbol_len - opts.lookaround_count);
 
             return .{ read, sig[start..][0..N] };
         }
@@ -363,5 +371,5 @@ test select_magnitude {
 }
 
 test Demodulator {
-    _ = Demodulator(31, 44_100, 882);
+    _ = Demodulator(26, 44_100, 441, .{});
 }

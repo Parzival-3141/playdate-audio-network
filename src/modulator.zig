@@ -6,6 +6,10 @@ const OscillatorRates = modem.OscillatorRates;
 const Symbol = modem.Symbol;
 const Oscillator = @import("Oscillator.zig");
 
+pub const Options = struct {
+    sine_table_len: u32 = 64,
+};
+
 /// Creates a type that modulates data as an audio signal.
 /// The signal uses a combination of frequency-shift keying (FSK) and amplitude-shifk keying (ASK).
 /// Sine waves are generated using a lookup table of the given length.
@@ -14,7 +18,7 @@ pub fn Modulator(
     comptime N: u16,
     comptime sample_rate: comptime_float,
     comptime baud: comptime_float,
-    comptime sine_table_len: u32,
+    comptime opts: Options,
 ) type {
     comptime {
         assert(N > 0);
@@ -36,7 +40,7 @@ pub fn Modulator(
             }
         }
 
-        pub const sine_table = Oscillator.create_sine_table(sine_table_len);
+        pub const sine_table = Oscillator.create_sine_table(opts.sine_table_len);
 
         header_osc: Oscillator,
         payload_oscs: [8]Oscillator,
@@ -103,7 +107,7 @@ pub fn Modulator(
 }
 
 test Modulator {
-    const M = Modulator(31, 44100, 882, 64);
+    const M = Modulator(26, 44100, 441, .{});
     var m = M.init();
     var buf: [100]f32 = undefined;
     m.modulate(.waiting, &buf);

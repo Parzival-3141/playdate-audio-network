@@ -189,7 +189,7 @@ fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     }
 }
 
-const Modulator = modem.Modulator(options.N, options.sample_rate, options.baud, 64);
+const Modulator = modem.modulator.Modulator(options.N, options.sample_rate, options.baud, .{});
 var modulator = Modulator.init();
 var modulator_sample_count: u16 = 0;
 const modulator_data: []const u8 =

@@ -16,8 +16,8 @@ const baud = options.baud;
 
 const modem = @import("modem");
 
-const Modulator = modem.Modulator(N, sample_rate, baud, 64);
-const Demodulator = modem.Demodulator(N, sample_rate, baud);
+const Modulator = modem.modulator.Modulator(N, sample_rate, baud, .{});
+const Demodulator = modem.demodulator.Demodulator(N, sample_rate, baud, .{});
 var mod = Modulator.init();
 var demod = Demodulator.init();
 
