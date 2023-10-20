@@ -21,8 +21,8 @@ pub const OscillatorRates = extern struct {
 
     pub const osc_count = 11;
 
-    /// Returns a set of oscillator phase rates (inverse frequencies) that are optimal for
-    /// Goertzel detection with N DFT terms at the given sample rate.
+    /// Returns a set of frequencies, normalized to a fraction [0, 1] of sample rate,
+    /// that are optimal for Goertzel detection with N DFT terms.
     ///
     /// One symbol requires 11 unique frequencies, in increasing order:
     /// - Three for the header oscillator, waiting/ready/payload (FSK)
