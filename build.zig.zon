@@ -3,8 +3,15 @@
     .version = "0.1.0",
     .dependencies = .{
         .portaudio = .{
-            .url = "https://github.com/hryx/portaudio/archive/f9dfb84aa8553729ba5778a92f7fad1cc55b8eb8.tar.gz",
-            .hash = "1220a2c9fa17b4f08cc8d280ddb2ba7423c18ce911b1aa4776fd471a78f07b5fdeb8",
+            .url = "https://github.com/hryx/portaudio/archive/33b3dbd787e996c1c454287eeb6b8224ca12296a.tar.gz",
+            .hash = "1220bfcaf393fc5fee7d04d227ad0ac5fa0ac8644311c204a585f489d56ac6feca5d",
         },
+    },
+    .paths = .{
+        "examples/",
+        "platform/",
+        "src/",
+        "build.zig",
+        "build.zig.zon",
     },
 }

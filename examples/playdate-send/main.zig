@@ -1,6 +1,7 @@
 const std = @import("std");
 const pdapi = @import("playdate");
-const Modulator = @import("modem").modulator.Modulator;
+const modem = @import("modem");
+const options = @import("options");
 
 var g_playdate_image: *pdapi.LCDBitmap = undefined;
 var playdate: *pdapi.PlaydateAPI = undefined;
@@ -44,6 +45,7 @@ fn menu_item(_: ?*anyopaque) callconv(.C) void {
 }
 
 var sound_toggle = false;
+var send_data = false;
 var phase: f32 = 0;
 var frequency: f32 = 110;
 var dc_amp: i16 = 0;
@@ -122,6 +124,7 @@ fn update_and_render(_: ?*anyopaque) callconv(.C) c_int {
     if (pushed.up and sequence_periods_index < sequence_periods.len - 1) sequence_periods_index += 1;
     if (pushed.down and sequence_periods_index > 0) sequence_periods_index -= 1;
 
+    if (pushed.a) send_data = !send_data;
     if (pushed.b) sound_toggle = !sound_toggle;
 
     if (playdate.system.isCrankDocked() == 0) {
@@ -186,18 +189,8 @@ fn generate_sine(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     }
 }
 
-const modulator_N = 36;
-const modulator_base_freq = 44_100.0 / modulator_N;
-var modulator = Modulator(1, &.{
-    .{ modulator_base_freq * 1, modulator_base_freq * 2 },
-    .{ modulator_base_freq * 3, modulator_base_freq * 4 },
-    .{ modulator_base_freq * 5, modulator_base_freq * 6 },
-    .{ modulator_base_freq * 7, modulator_base_freq * 8 },
-    .{ modulator_base_freq * 9, modulator_base_freq * 10 },
-    .{ modulator_base_freq * 11, modulator_base_freq * 12 },
-    .{ modulator_base_freq * 13, modulator_base_freq * 14 },
-    .{ modulator_base_freq * 15, modulator_base_freq * 16 },
-}, 44_100, 64).init();
+const Modulator = modem.modulator.Modulator(options.N, options.sample_rate, options.baud, .{});
+var modulator = Modulator.init();
 var modulator_sample_count: u16 = 0;
 const modulator_data: []const u8 =
     \\One morning, as Gregor Samsa was waking up from anxious dreams, he
@@ -210,22 +203,32 @@ const modulator_data: []const u8 =
     \\
     \\
 ;
-var modulator_data_index: u16 = modulator_data.len;
+var modulator_data_index: u16 = 0;
+
+var next_symbol_signal_buf: [Modulator.symbol_len]f32 = undefined;
+var next_symbol_ready = false;
+var next_symbol_index: u16 = 0;
 
 fn generate_modulated_data(left: [*]i16, right: [*]i16, count: u32) callconv(.C) void {
     for (left[0..count], right[0..count]) |*out, *dead| {
-        var mixed: f32 = 0;
-        const vals = modulator.generate_sample();
-        for (vals) |v| mixed += v;
-        out.* = convert_sample(mixed * 0.125);
-
         dead.* = 0;
 
-        modulator_sample_count += 1;
-        if (modulator_sample_count >= sequence_periods[sequence_periods_index]) {
-            modulator_data_index = @intCast((modulator_data_index + 1) % modulator_data.len);
-            modulator.symbol = @bitCast(modulator_data[modulator_data_index]);
-            modulator_sample_count = 0;
+        if (!next_symbol_ready) {
+            const symbol: modem.Symbol = if (send_data) blk: {
+                const sym = .{ .payload = modulator_data[modulator_data_index] };
+                modulator_data_index = @intCast((modulator_data_index + 1) % modulator_data.len);
+                break :blk sym;
+            } else .ready;
+
+            modulator.modulate(symbol, &next_symbol_signal_buf);
+            next_symbol_ready = true;
+            next_symbol_index = 0;
+        }
+
+        out.* = convert_sample(next_symbol_signal_buf[next_symbol_index]);
+        next_symbol_index += 1;
+        if (next_symbol_index == next_symbol_signal_buf.len) {
+            next_symbol_ready = false;
         }
     }
 }

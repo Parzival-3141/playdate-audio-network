@@ -6,7 +6,17 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const sample_rate = b.option(f64, "sample-rate", "Audio sample rate; device must support this when using real-time audio (default 44100)") orelse 44_100.0;
+    const N = b.option(u16, "N", "Determines modem oscillator and analysis frequencies (default 26)") orelse 26;
+    const baud = b.option(f64, "baud", "Modem symbol rate (default 441)") orelse 441;
     const sdk_path = b.option([]const u8, "playdate-sdk-path", "Path to installed Playdate SDK");
+
+    const log_level = b.option(std.log.Level, "log-level", "Log verbosity threshold") orelse .info;
+    const options = b.addOptions();
+    options.addOption(std.log.Level, "log_level", log_level);
+    options.addOption(f64, "sample_rate", sample_rate);
+    options.addOption(u16, "N", N);
+    options.addOption(f64, "baud", baud);
 
     const playdate_mod = b.createModule(.{ .source_file = .{ .path = "src/playdate.zig" } });
     const modem_mod = b.addModule("modem", .{ .source_file = .{ .path = "src/modem.zig" } });
@@ -17,16 +27,6 @@ pub fn build(b: *std.Build) !void {
     );
     const portaudio_lib = portaudio_dep.artifact("portaudio");
 
-    const example_dump_exe = b.addExecutable(.{
-        .name = "example-demodulator-dump",
-        .root_source_file = .{ .path = "examples/demodulator_dump.zig" },
-        .target = target,
-        .optimize = optimize,
-    });
-    example_dump_exe.addModule("modem", modem_mod);
-    example_dump_exe.linkLibrary(portaudio_lib);
-    b.installArtifact(example_dump_exe);
-
     const example_send_game = try addPlaydateGameExe(b, .{ .path = "examples/playdate-send/main.zig" }, .{
         .optimize = optimize,
         .assets_dir = "examples/playdate-send/assets",
@@ -34,17 +34,48 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "modem", .module = modem_mod },
             .{ .name = "playdate", .module = playdate_mod },
         },
+        .options = options,
     });
     try addPlaydateSimulatorRun(b, "example-playdate-send", example_send_game, sdk_path);
 
-    const example_dump_run_cmd = b.addRunArtifact(example_dump_exe);
-    example_dump_run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        example_dump_run_cmd.addArgs(args);
+    const pc_examples = .{
+        .{ .name = "demodulator-dump", .src = "demodulator_dump.zig", .pa = true },
+        .{ .name = "modulator-write-raw", .src = "modulator_write_raw.zig", .pa = false },
+        .{ .name = "visualize-goertzel", .src = "visualize_goertzel.zig", .pa = true },
+    };
+    inline for (pc_examples) |ex| {
+        const exe = b.addExecutable(.{
+            .name = ex.name,
+            .root_source_file = .{ .path = "examples/" ++ ex.src },
+            .target = target,
+            .optimize = optimize,
+        });
+        exe.addModule("modem", modem_mod);
+        exe.addOptions("options", options);
+        if (ex.pa) exe.linkLibrary(portaudio_lib);
+        b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| {
+            run.addArgs(args);
+        }
+
+        const run_step = b.step("example-" ++ ex.name, "Run example " ++ ex.name);
+        run_step.dependOn(&run.step);
     }
 
-    const example_dump_run_step = b.step("example-demodulator-dump", "Run the demodulator dump example");
-    example_dump_run_step.dependOn(&example_dump_run_cmd.step);
+    const tests = b.addTest(.{
+        .root_source_file = .{ .path = "src/modem.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    tests.filter = b.option([]const u8, "test-filter", "Filter tests by name");
+
+    const tests_run_cmd = b.addRunArtifact(tests);
+
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&tests_run_cmd.step);
 }
 
 const playdate_target = blk: {
@@ -59,6 +90,7 @@ const PlaydateGameExeOptions = struct {
     optimize: std.builtin.OptimizeMode,
     assets_dir: ?[]const u8 = null,
     modules: []const std.Build.ModuleDependency,
+    options: *std.Build.Step.Options,
 };
 
 const PlaydateGameExe = struct {
@@ -81,6 +113,7 @@ fn addPlaydateGameExe(
         .optimize = opts.optimize,
         .target = .{},
     });
+    lib.addOptions("options", opts.options);
     for (opts.modules) |mod| {
         lib.addModule(mod.name, mod.module);
     }
@@ -97,6 +130,7 @@ fn addPlaydateGameExe(
         .target = playdate_target,
         .optimize = opts.optimize,
     });
+    exe.addOptions("options", opts.options);
     for (opts.modules) |mod| {
         exe.addModule(mod.name, mod.module);
     }
